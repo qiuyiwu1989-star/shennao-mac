@@ -1,0 +1,17 @@
+.build/
+*.app/
+.DS_Store
+__pycache__/
+*.pyc
+# 凭证与录音本体绝不进仓
+deepbrain.json
+credentials.json
+*.ogg
+*.opus
+*.caf
+*.m4a
+# 图标派生物：由 make-icon.swift 从源图生成，不入仓
+icon/*.iconset/
+icon/*.icns
+icon/make-icon
+icon/preview-*.png

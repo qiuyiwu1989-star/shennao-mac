@@ -1,0 +1,141 @@
+<title>采集参数 A/B</title>
+<style>
+:root{--bg:#f4f5f8;--surface:#fff;--ink:#16181f;--body:#646b7d;--muted:#6f7688;
+      --brand:#7b80ff;--brandDeep:#5a4fe6;--line:#d3d7e0;--bad:#dc2626;--ok:#16a34a}
+:root:not([data-theme="light"]){}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#16181c;--surface:#1d2026;--ink:#eceeff;--body:#9096a4;--muted:#9096a4;--line:#2c313a}}
+:root[data-theme="dark"]{--bg:#16181c;--surface:#1d2026;--ink:#eceeff;--body:#9096a4;--muted:#9096a4;--line:#2c313a}
+body{background:var(--bg);color:var(--ink);font:15px/1.7 -apple-system,"PingFang SC",sans-serif;
+     margin:0;padding:40px 20px}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:32px;font-weight:600;letter-spacing:-.4px;margin:0 0 8px}
+p.lead{color:var(--body);margin:0 0 24px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 4px}
+.card .why{color:var(--muted);font-size:13px;margin:0 0 12px}
+button{font:inherit;font-size:15px;border:0;border-radius:999px;padding:10px 24px;cursor:pointer}
+.primary{background:var(--brandDeep);color:#fff}
+.primary:disabled{opacity:.45;cursor:default}
+.ghost{background:transparent;color:var(--brandDeep);border:1px solid var(--line)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.timer{font:600 28px/1 ui-monospace,monospace;margin:16px 0}
+.meter{height:6px;background:var(--line);border-radius:999px;overflow:hidden;margin:6px 0 14px}
+.meter i{display:block;height:100%;background:var(--brand);width:0}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:500;font-size:13px}
+code{background:var(--bg);padding:1px 5px;border-radius:6px;font-size:13px}
+.warn{color:var(--bad)}
+.scroll{overflow-x:auto}
+audio{width:100%;margin-top:8px}
+</style>
+
+<div class="wrap">
+<h1>采集参数 A/B</h1>
+<p class="lead">同一时刻、同一个麦克风、同一段声音，开两路 <code>getUserMedia</code>，只有降噪/回声消除/自动增益的开关不同。<strong>不是读两遍</strong>——读两遍的差别会被朗读本身的差异淹没。</p>
+
+<div class="card">
+  <h2>要验证什么</h2>
+  <p class="why">深脑网页端现在这么开麦（<code>web-recording/session.ts:61</code>）：</p>
+  <div class="scroll"><table>
+    <tr><th>参数</th><th>现在</th><th>怀疑</th></tr>
+    <tr><td><code>echoCancellation</code></td><td>true</td><td rowspan="3">这三个是打电话用的语音处理，假设「一个人贴着麦、其余都是噪声」。开会时屋里几个人远近不一，远处的人会被当噪声压掉，句子开头也容易被吞。</td></tr>
+    <tr><td><code>noiseSuppression</code></td><td>true</td></tr>
+    <tr><td><code>autoGainControl</code></td><td>未设（Chrome 默认 true）</td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>怎么用</h2>
+  <p class="why">别对着麦克风一个人念——那正好是这套处理擅长的场景，测不出问题。要复现的是<strong>开会</strong>：让两三个人坐在不同距离说话，或者用音箱放一段真实会议录音，麦克风摆远一点。录 30 秒以上。</p>
+  <div class="row">
+    <button class="primary" id="go">开始双路录音</button>
+    <button class="ghost" id="stop" disabled>停止</button>
+  </div>
+  <div class="timer" id="t">00:00</div>
+  <div class="meter"><i id="lv"></i></div>
+  <p class="why" id="msg">还没开始。</p>
+</div>
+
+<div class="card" id="out" hidden>
+  <h2>两段录音</h2>
+  <p class="why">存下来，分别推给深脑转写，再对比同一句话的准确率。文件名里带了参数，别搞混。</p>
+  <div id="clips"></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const CONFIGS=[
+  {key:'processed',label:'A · 现在的设置（降噪+回声消除开）',
+   c:{channelCount:1,echoCancellation:true,noiseSuppression:true}},
+  {key:'raw',label:'B · 全关（会议场景）',
+   c:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}},
+];
+let recs=[],streams=[],t0=0,tick=null,ac=null;
+
+function fmt(ms){const s=Math.floor(ms/1000);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+
+$('go').onclick=async()=>{
+  $('go').disabled=true;$('msg').textContent='正在申请麦克风…';
+  try{
+    recs=[];streams=[];
+    for(const cfg of CONFIGS){
+      // 同一个设备开两路：浏览器会给两条独立处理链，声学输入完全同源。
+      const s=await navigator.mediaDevices.getUserMedia({audio:cfg.c,video:false});
+      const mime=['audio/webm;codecs=opus','audio/mp4'].find(m=>MediaRecorder.isTypeSupported(m));
+      const r=new MediaRecorder(s,mime?{mimeType:mime}:{});
+      const chunks=[];
+      r.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+      r.onstop=()=>{cfg.blob=new Blob(chunks,{type:mime||'audio/webm'});render()};
+      streams.push(s);recs.push(r);cfg.blob=null;
+    }
+    // 电平表挂在 B 路上：它没有自动增益，看到的才是真实音量
+    ac=new AudioContext();
+    const an=ac.createAnalyser();an.fftSize=512;
+    ac.createMediaStreamSource(streams[1]).connect(an);
+    const buf=new Uint8Array(an.frequencyBinCount);
+    (function draw(){
+      if(!ac)return;an.getByteTimeDomainData(buf);
+      let peak=0;for(const v of buf)peak=Math.max(peak,Math.abs(v-128));
+      $('lv').style.width=Math.min(100,peak/128*180)+'%';requestAnimationFrame(draw);
+    })();
+
+    recs.forEach(r=>r.start());
+    t0=Date.now();$('stop').disabled=false;
+    $('msg').textContent='两路都在录。让不同距离的人轮流说话，至少 30 秒。';
+    tick=setInterval(()=>{$('t').textContent=fmt(Date.now()-t0)},200);
+  }catch(e){
+    $('go').disabled=false;
+    $('msg').innerHTML='<span class="warn">开不了麦克风：'+e.message+'</span>';
+  }
+};
+
+$('stop').onclick=()=>{
+  clearInterval(tick);$('stop').disabled=true;$('go').disabled=false;
+  recs.forEach(r=>r.state!=='inactive'&&r.stop());
+  streams.forEach(s=>s.getTracks().forEach(t=>t.stop()));
+  if(ac){ac.close();ac=null}
+  $('lv').style.width=0;
+  $('msg').textContent='录完了。两段都存下来，分别推给深脑。';
+};
+
+function render(){
+  if(CONFIGS.some(c=>!c.blob))return;
+  $('out').hidden=false;
+  $('clips').innerHTML='';
+  const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+  for(const c of CONFIGS){
+    const d=document.createElement('div');d.style.marginBottom='18px';
+    const url=URL.createObjectURL(c.blob);
+    d.innerHTML='<div style="font-weight:600;font-size:14px">'+c.label+'</div>'+
+      '<div style="color:var(--muted);font-size:13px">'+(c.blob.size/1024).toFixed(0)+' KB</div>'+
+      '<audio controls src="'+url+'"></audio>';
+    const a=document.createElement('a');
+    a.href=url;a.download='ab-'+stamp+'-'+c.key+'.webm';
+    a.textContent='下载这一段';a.style.cssText='display:inline-block;margin-top:6px;color:var(--brandDeep);font-size:14px';
+    d.appendChild(a);$('clips').appendChild(d);
+  }
+}
+</script>
+</div>

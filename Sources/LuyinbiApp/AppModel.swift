@@ -40,6 +40,8 @@ struct AppActions {
     var resolveBindMismatch: @MainActor (String) async -> Bool = { _ in false }
     /// 账号不匹配警告里点了「取消」：这支笔这次不同步，警告卡片消失。
     var dismissBindMismatch: @MainActor () -> Void = {}
+    /// 真去验一次会话还能不能用（不是只看本地存没存过 token）。
+    var checkSession: @MainActor () async -> DeepBrain.AuthState = { .none }
 }
 
 /// 界面侧的唯一数据源。
@@ -58,6 +60,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var phase: SyncPhase = .idle
     /// 设备-账号绑定不一致，等着人确认（spec 019）。非 nil 时「设备」页要显示确认卡片。
     @Published private(set) var pendingBindMismatch: BindMismatch?
+    /// 整条推送链为什么停着。非 nil 时主窗口顶部显示横幅。
+    @Published private(set) var uploadBlocked: String?
     @Published private(set) var lastRun: Date?
     @Published private(set) var lastSummary: String = ""
 
@@ -106,6 +110,8 @@ final class AppModel: ObservableObject {
     /// 窗口先摆出来，登录态异步查。
     @Published var signedIn: Bool?
     @Published var signedInEmail: String?
+    /// 会话被服务端判为失效时给人看的一句话。登录页据此说明"为什么又要登一次"。
+    @Published var sessionNotice: String?
     @Published var launchAtLogin = false
 
     /// 窗口出来之后再查，慢一点没关系，卡住才是灾难。
@@ -135,6 +141,13 @@ final class AppModel: ObservableObject {
         items[i].brainTitle = title
     }
 
+    /// 查登录态。
+    ///
+    /// **先用本地那份把界面点亮，再去服务端真验一次。**
+    /// 只看本地会犯 2026-09-07 那个错：存着一个早就失效的 token，
+    /// 界面一直显示「已登录」、永远不弹登录页，而后台每一次推送都在静默失败。
+    /// 只等服务端又太慢——开窗要先干等一个网络往返，断网时更是永远转圈。
+    /// 所以两段式：本地先给个乐观值，服务端回话后再纠正。
     func refreshAuthAsync() {
         Task.detached(priority: .utility) {
             let has = DeepBrain.hasCredentials
@@ -144,6 +157,22 @@ final class AppModel: ObservableObject {
                 self.signedIn = has
                 self.signedInEmail = mail
                 self.launchAtLogin = login
+            }
+            guard has else { return }
+            let state = await self.actions.checkSession()
+            await MainActor.run {
+                switch state {
+                case .expired:
+                    // 服务端明确不认这份凭证：清掉，把人送去登录页。
+                    // 留着它只会让每一次推送继续静默失败，而界面还说「已登录」。
+                    self.actions.signOut()
+                    self.sessionNotice = "登录已失效，请重新登录"
+                case .valid:
+                    self.sessionNotice = nil
+                case .unreachable, .none:
+                    // 连不上说明不了什么，别把人踢出去。
+                    break
+                }
             }
         }
     }
@@ -188,6 +217,7 @@ final class AppModel: ObservableObject {
         items = engine.items
         phase = engine.phase
         pendingBindMismatch = engine.pendingBindMismatch
+        uploadBlocked = engine.uploadBlocked
         lastRun = engine.lastRun
         lastSummary = engine.lastSummary
         // 选中的行如果没了，清掉选中，别让详情面板悬空。
@@ -200,7 +230,7 @@ final class AppModel: ObservableObject {
         var s = "\(d.name)|\(d.connected)|\(d.battery ?? 255)|\(d.firmware ?? "")|\(d.gain ?? 255)"
         s += "|\(d.recordStatus ?? 255)|\(d.capacityRemain ?? 0)|\(d.capacityTotal ?? 0)"
         s += "|\(e.phase.label)|\(e.lastRun?.timeIntervalSince1970 ?? 0)|\(e.lastSummary)"
-        s += "|\(e.pendingBindMismatch?.id ?? "")"
+        s += "|\(e.pendingBindMismatch?.id ?? "")|\(e.uploadBlocked ?? "")"
         for i in e.items {
             s += "#\(i.base),\(i.durationSec),\(i.deviceSize ?? 0),\(i.localBytes ?? 0)"
             s += ",\(i.sessionId ?? ""),\(i.brainStatus ?? ""),\(i.transcriptId ?? ""),\(i.lastError ?? "")"

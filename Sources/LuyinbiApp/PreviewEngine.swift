@@ -13,6 +13,7 @@ final class PreviewEngine: SyncEngineObserving {
     private(set) var items: [RecordingItem] = []
     private(set) var phase: SyncPhase = .idle
     private(set) var pendingBindMismatch: BindMismatch?
+    private(set) var uploadBlocked: String?
     private(set) var lastRun: Date?
     private(set) var lastSummary: String = "尚未同步"
 

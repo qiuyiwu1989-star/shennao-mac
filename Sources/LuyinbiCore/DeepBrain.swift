@@ -407,4 +407,38 @@ public extension DeepBrain {
 
     static var signedInEmail: String? { TokenStore.get("email") }
     static var hasCredentials: Bool { TokenStore.get() != nil }
+
+    /// 会话到底还能不能用。
+    ///
+    /// **`hasCredentials` 只回答「存过 token 吗」，不回答「这 token 还有效吗」。**
+    /// 2026-09-07 真实事故：本机存着一个 12 位的坏 refresh token（钥匙串和
+    /// credentials.json 里是同一个），`hasCredentials` 照样返回 true，于是
+    /// 界面认为「已登录」直接进主窗口、**永远不弹登录页**；而所有要登录的
+    /// 动作（推深脑、设备绑定）全都在后台静默失败。用户看到的是「同步不动了」，
+    /// 完全看不出是登录的问题，只能靠人去猜「先退出登录再重登」。
+    ///
+    /// 所以要真去换一次 token 才算数。三种结果必须分开——
+    /// **「服务端说这 token 不认」和「现在连不上服务端」不是一回事**：
+    /// 前者该把人送去登录页，后者只是暂时没网，把人踢去登录页反而是错的
+    /// （他的登录明明是好的，只是此刻在飞机上）。
+    enum AuthState {
+        case valid
+        case expired          // 服务端明确拒绝：token 无效/过期，必须重新登录
+        case unreachable      // 网络不通，说不清，保持现状
+        case none             // 本来就没登录过
+    }
+
+    static func checkSession(config: DeepBrainConfig) async -> AuthState {
+        guard TokenStore.get() != nil else { return .none }
+        let brain = DeepBrain(config: config)
+        do {
+            try await brain.connect()
+            return .valid
+        } catch let e as DeepBrainError {
+            if case .http(_, let code, _) = e, code >= 400, code < 500 { return .expired }
+            return .unreachable
+        } catch {
+            return .unreachable
+        }
+    }
 }

@@ -110,6 +110,7 @@ public protocol SyncEngineObserving: AnyObject {
     var items: [RecordingItem] { get }
     var phase: SyncPhase { get }
     var pendingBindMismatch: BindMismatch? { get }
+    var uploadBlocked: String? { get }
     var lastRun: Date? { get }
     var lastSummary: String { get }
 }

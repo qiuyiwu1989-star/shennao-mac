@@ -30,6 +30,14 @@ struct WelcomeView: View {
             .padding(.bottom, 26)
 
             VStack(alignment: .leading, spacing: 12) {
+                // 被动退出（凭证失效）和主动第一次登录，是两件事，话要说清楚——
+                // 不解释一句，用户只会觉得「我明明登过，怎么又要登」。
+                if let notice = model.sessionNotice {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.warn)
+                        Text(notice).font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.warn)
+                    }
+                }
                 Text("先登录你的深脑账号").font(DS.bodyFont(DS.T.body, .semibold))
                     .foregroundStyle(DS.title(scheme == .dark))
 

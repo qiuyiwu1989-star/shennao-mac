@@ -42,6 +42,10 @@ final class AppState {
                                  transcriptIds: model.transcriptIdMap)
         }
         model.actions.openLog = { [engine] in NSWorkspace.shared.open(engine.paths.syncLog) }
+        model.actions.checkSession = { [engine] in
+            guard let cfg = try? DeepBrainConfig.load(from: engine.paths.deepBrainConfig) else { return .none }
+            return await DeepBrain.checkSession(config: cfg)
+        }
         model.actions.resolveBindMismatch = { [engine] name in await engine.resolveBindMismatch(newDeviceName: name) }
         model.actions.dismissBindMismatch = { [engine] in engine.dismissBindMismatch() }
         model.cleanupEnabled = engine.cleanup.deleteAfterSync
@@ -71,8 +75,16 @@ final class AppState {
                 return nil
             } catch { return "\(error)" }
         }
+        // **退出登录必须无条件清掉本地凭证。**
+        // 原来走 `uiBrain()`（allowUnauthenticated 默认 false）——而它内部要先
+        // ensureBrain() 成功才给实例。于是凭证一旦失效，uiBrain() 返回 nil、
+        // signOut() 根本不执行，TokenStore.clear() 也就没跑：界面显示已退出，
+        // 磁盘上那份坏 token 原封不动，下次启动又被当成「已登录」。
+        // 2026-09-07：这正是「退出登录也救不回来」的那一环——**最需要退出的时候，
+        // 退出功能恰好因为同一个原因失灵**。清本地这件事不该依赖网络。
         model.actions.signOut = { [weak model] in
-            Task { await AppState.shared.engine.uiBrain()?.signOut() }
+            TokenStore.clear()
+            Task { await AppState.shared.engine.uiBrain(allowUnauthenticated: true)?.signOut() }
             model?.signedIn = false
             model?.signedInEmail = nil
         }

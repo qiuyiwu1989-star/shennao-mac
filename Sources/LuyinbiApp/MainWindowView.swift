@@ -45,6 +45,11 @@ struct MainWindowView: View {
     var body: some View {
         VStack(spacing: 0) {
             deviceBar
+            // 「为什么卡住」必须和「卡住了」摆在一起。
+            // 2026-09-07：登录失效那次，每条录音都显示「推送卡住」，而原因
+            // （连不上深脑）只写在同步日志里——症状铺满屏幕，病因一个字都看不见，
+            // 于是只能一条条猜。这条横幅就是把病因搬到症状旁边。
+            if let blocked = model.uploadBlocked { blockedBanner(blocked) }
             Divider()
             HStack(spacing: 0) {
                 SideRail(section: $section, pending: pendingSpeakers,
@@ -87,6 +92,19 @@ struct MainWindowView: View {
         case .audit:
             ArchiveAuditPanel(model: model)
         }
+    }
+
+    /// 整条推送链停摆时的横幅。给原因，也给出口——只说"卡住了"等于没说。
+    private func blockedBanner(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.warn)
+            Text(text).font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.title(scheme == .dark))
+            Spacer(minLength: 8)
+            Button("查看日志") { model.actions.openLog() }
+                .buttonStyle(DSSecondaryButtonStyle())
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(DS.warn.opacity(0.12))
     }
 
     /// 设备压成一行。电量、固件、增益基本不变，不该占三分之一屏。

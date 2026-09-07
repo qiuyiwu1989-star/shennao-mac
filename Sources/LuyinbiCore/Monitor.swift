@@ -68,6 +68,16 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     /// 刚开完会还记得这是什么，比事后在网页里对着一列时间戳猜要强。
     public var plan: [String: Plan] = [:]
 
+    /// 连续下载失败次数（按 manifestKey 记）。
+    ///
+    /// 设备列表里报着、但每次下载都拿回 0 字节的「僵尸条目」，因为从没成功过、
+    /// 清单里也就没记账，于是**每一轮同步都把它当成新文件再试一遍**。
+    /// 2026-09-07 实测：一条这样的文件从 8/30 到 9/7 试了 97 次，
+    /// 每次都占掉一段本就只有 27KB/s 的蓝牙连接时间，日志里还刷满噪音。
+    /// 攒够 `SyncPlanner.giveUpAfter` 次就不再自动重试——但绝不删账、
+    /// 也不隐藏，界面上仍看得到并且能手动重试（设备换个姿势、固件重启都可能就好了）。
+    public var downloadFailures: [String: Int] = [:]
+
     public struct Plan: Codable, Equatable, Sendable {
         public var title: String?
         public var projectId: String?
@@ -78,7 +88,9 @@ public struct SyncManifest: Codable, Equatable, Sendable {
 
     public init() {}
 
-    private enum CodingKeys: String, CodingKey { case imported, uploaded, deleted, starred, plan }
+    private enum CodingKeys: String, CodingKey {
+        case imported, uploaded, deleted, starred, plan, downloadFailures
+    }
 
     /// 逐键容错解码：某一个键的结构变了（比如 Cleanup 换了 deleted 的写法），
     /// 不该把整份清单一起带走——那等于把「已导入」全忘光，下次会把设备里的东西重导一遍。
@@ -91,6 +103,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
         // 编译不报错，功能静默失效，最难查的那种。
         starred = (try? c.decode([String].self, forKey: .starred)) ?? []
         plan = (try? c.decode([String: Plan].self, forKey: .plan)) ?? [:]
+        downloadFailures = (try? c.decode([String: Int].self, forKey: .downloadFailures)) ?? [:]
     }
 
     public static func load(from url: URL) -> SyncManifest {
@@ -162,6 +175,14 @@ public enum SyncPlanner {
     /// 判据只认硬证据：本地裸包大小 == 设备报的大小，且能被 40 整除
     /// （40 B = 20 ms，除不尽就是截断）。差一个字节都按没下完处理——
     /// 宁可重下，也不能把半截录音当成完整的推上去。
+    /// 连续失败多少次之后不再自动重试。
+    ///
+    /// 5 次的来历：真实的可恢复失败（信号弱、设备正忙、连接抖动）实测最多两三次
+    /// 就会成功一次；而**结构性坏掉的条目一次都不会成**（设备报着它、
+    /// 一下载就回 0 字节，9 天 97 次没有一次例外）。5 次留足了给前者，
+    /// 又不至于让后者无限占用连接时间。
+    public static let giveUpAfter = 5
+
     public static func pending(entries: [FileEntry], manifest: SyncManifest,
                                status: UInt8?, current: String?,
                                localRaw: [String: Int] = [:]) -> [FileEntry] {
@@ -170,8 +191,16 @@ public enum SyncPlanner {
             guard !isLive(e, status: status, current: current) else { return false }
             if let have = localRaw[normalizedBase(e.name)],
                have == Int(e.size), have % 40 == 0, have > 0 { return false }
+            // 连续失败够多次就不再自动重试。**只停自动，不停手动**——
+            // 这是「别再浪费每一轮的连接时间」，不是「这条不要了」。
+            if (manifest.downloadFailures[manifestKey(e)] ?? 0) >= giveUpAfter { return false }
             return true
         }
+    }
+
+    /// 攒够次数、已经被自动重试放弃的条目。界面据此显示「试了 N 次都没成，点这里再试」。
+    public static func givenUp(entries: [FileEntry], manifest: SyncManifest) -> [FileEntry] {
+        entries.filter { (manifest.downloadFailures[manifestKey($0)] ?? 0) >= giveUpAfter }
     }
 
     /// 一次下载算不算真的完整。
@@ -331,6 +360,9 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     /// 设备-账号绑定不一致，等着人确认（spec 019）。非 nil 时这支笔的同步全部拦下——
     /// 见 runSync 里的绑定检查。界面（DevicePage）据此显示确认卡片。
     @Published public private(set) var pendingBindMismatch: BindMismatch?
+    /// 整条推送链为什么停着（连不上深脑/登录失效）。非 nil 时主窗口顶部挂一条横幅。
+    /// 症状（「推送卡住」）到处都是，病因只有一个地方知道——就是这里。
+    @Published public private(set) var uploadBlocked: String?
     /// base -> 文件后缀（ogg / m4a）。上传时要按它取文件和 mime。
     private var uploadExt: [String: String] = [:]
 
@@ -362,6 +394,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     /// transcript_id -> 标题。与 unconfirmedSpeakers 同一轮批量拉。
     private var brainTitles: [String: String] = [:]
     private var brainPollTask: Task<Void, Never>?
+    private var uploadRetryTask: Task<Void, Never>?
     private var idleRounds: [String: Int] = [:]
     private var cleanupLoaded = false
     private var brain: DeepBrain?
@@ -404,6 +437,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         loadCleanupSettingsOnce()
         recoverStrandedRecordings()
         startBrainPolling()
+        startUploadRetry()
         log.write("开始持续监听（广播流，冷却 \(Int(cooldown))s，自动清理 \(cleanup.deleteAfterSync ? "开" : "关")）")
         guard monitorTask == nil else { return }
         monitoring = true
@@ -421,6 +455,8 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         log.write("停止监听")
         brainPollTask?.cancel()
         brainPollTask = nil
+        uploadRetryTask?.cancel()
+        uploadRetryTask = nil
         monitoring = false
         if !isSyncing {
             monitorTask?.cancel()
@@ -657,6 +693,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
                 log.write(String(format: "下载失败 %@：%@ 拿到 %d/%@ B 续传%d次 %.0fs",
                                  base, why, res.data.count,
                                  String(e.size), res.resumes, res.seconds))
+                noteDownloadFailure(e)
                 refreshLocalView()
                 continue
             }
@@ -678,6 +715,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
                                       res.data.count, want, pct)
                 log.write(String(format: "下载不完整 %@：收到 %d/%d 字节（%.1f%%）续传%d次，丢弃重来",
                                  base, res.data.count, want, pct, res.resumes))
+                noteDownloadFailure(e)
                 refreshLocalView()
                 continue
             }
@@ -709,6 +747,9 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             manifest = SyncManifest.load(from: paths.manifest)   // 重读：Cleanup 可能刚写过 deleted
             manifest.imported[SyncPlanner.manifestKey(e)] = SyncManifest.Imported(
                 file: outName, bytes: res.data.count, at: Self.stamp(Date()))
+            // 成功了就把失败账清零——判据是「**连续**失败」，
+            // 不清的话一条平时偶尔抖一下的文件，攒够五次就再也不自动下了。
+            manifest.downloadFailures[SyncPlanner.manifestKey(e)] = nil
             try? manifest.save(to: paths.manifest)
             imported += 1
             log.write("导入 \(outName) \(res.data.count)B \(String(format: "%.1f", res.kbps))KB/s"
@@ -853,10 +894,17 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         guard !uploadQueue.isEmpty else { refreshLocalView(); return 0 }
 
         guard let brain = await ensureBrain() else {
-            lastSummary = "深脑未接通，本次只落盘（先用 Python 版登录）"
+            lastSummary = "深脑未接通，本次只落盘"
+            // **把「为什么推不上去」摆到界面上，而不是只留在日志里。**
+            // 2026-09-07：登录失效期间，界面上每一条都显示「推送卡住」，
+            // 而真正的原因（连不上深脑/登录失效）只写在同步日志里——
+            // 用户看得见症状、看不见病因，只能一条条猜，最后花了几小时。
+            // 队列里有东西、又接不通，就是**整条推送链停摆**，值得一句明说。
+            uploadBlocked = "推送暂停：连不上深脑（\(uploadQueue.count) 条在等）——多半是登录失效，点右上角账号图标重新登录"
             refreshLocalView()
             return 0
         }
+        uploadBlocked = nil
 
         let rawSizes = scanLocal(paths.rawPackets, ext: "opus")
         let now = Date()
@@ -1039,6 +1087,33 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         }
     }
 
+    /// 独立的补推循环：只要还有欠深脑的，就定时试一次，**不依赖录音笔出现**。
+    ///
+    /// 2026-09-07 真实事故的收尾：登录失效期间下载照常、上传全挂；
+    /// 登录 17:45 修好之后，那 4 条积压却一直躺到 17:59 人手点了「立即同步」才动。
+    /// 原因是**刷上传队列只挂在两个地方**——一轮完整的蓝牙同步里，或者人手点按钮。
+    /// 录音笔不在身边（空闲 7–8 分钟就停广播），积压就无限期不动，
+    /// 而界面上只写「推送卡住」，看不出它在等的其实是一支笔。
+    ///
+    /// 下载要等设备是物理必然，上传不是——上传只需要网络。两件事本来就该解耦，
+    /// 这个循环把它补上。队列空时几乎零成本（一次磁盘扫描），所以敢跑得勤一点。
+    private func startUploadRetry() {
+        uploadRetryTask?.cancel()
+        uploadRetryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.uploadRetryInterval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                // 正在同步就跳过：那一轮自己结束时会刷队列，两边同时推是白费力气。
+                guard !self.isSyncing else { continue }
+                await self.flushUploadQueue()
+            }
+        }
+    }
+
+    /// 补推间隔。10 分钟：够快到「开完会回到座位就已经在传了」，
+    /// 又不至于在长期没网时把日志刷满。
+    private static let uploadRetryInterval: TimeInterval = 600
+
     // MARK: - 视图刷新
 
     /// 磁盘 + 清单 + 内存态 → items。每次状态变化都重算，保证界面和磁盘不会各说各话。
@@ -1134,6 +1209,35 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         guard (try? await b.connect()) != nil else { return nil }
         brain = b
         return b
+    }
+
+    /// 记一次下载失败。攒够 `SyncPlanner.giveUpAfter` 次就不再自动重试这一条。
+    ///
+    /// 每次都立刻写回磁盘，不攒到本轮结束——这份账要跨重启活着才有意义
+    /// （那条重试了 97 次的文件，横跨 9 天和无数次重启，只在内存里记等于没记）。
+    private func noteDownloadFailure(_ e: FileEntry) {
+        var m = SyncManifest.load(from: paths.manifest)
+        let key = SyncPlanner.manifestKey(e)
+        let n = (m.downloadFailures[key] ?? 0) + 1
+        m.downloadFailures[key] = n
+        try? m.save(to: paths.manifest)
+        if n == SyncPlanner.giveUpAfter {
+            let base = SyncPlanner.normalizedBase(e.name)
+            log.write("\(base) 连续 \(n) 次下载失败，不再自动重试（界面上仍可手动重试）")
+            errors[base] = "试了 \(n) 次都没拿到内容，已停止自动重试——可以手动再试一次"
+        }
+    }
+
+    /// 界面调用：人手要求重试一条已经被放弃的下载。把失败账清零，下一轮就会再排上。
+    public func retryGivenUpDownload(_ base: String) {
+        var m = SyncManifest.load(from: paths.manifest)
+        for key in m.downloadFailures.keys where key.contains(base) {
+            m.downloadFailures[key] = nil
+        }
+        try? m.save(to: paths.manifest)
+        errors[base] = nil
+        log.write("人手重置 \(base) 的下载失败计数，下一轮会重新尝试")
+        refreshLocalView()
     }
 
     // MARK: - 设备-账号绑定（spec 019）

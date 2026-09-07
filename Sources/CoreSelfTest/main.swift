@@ -176,6 +176,40 @@ do {
           SyncPlanner.unrecorded(entries: [zero], manifest: empty, status: nil, current: nil,
                                  localRaw: ["z": 0]).count, 0)
 
+    // ── 僵尸条目：连续失败够多次就不再自动重试 ─────────────────────────
+    // 实测过一条设备报着、一下就回 0 字节的文件，9 天里被自动重试了 97 次，
+    // 每次都占掉一段 27KB/s 的连接时间。判据是「连续」失败，成功一次就清零。
+    do {
+        var m = SyncManifest()
+        let key = SyncPlanner.manifestKey(e)
+
+        m.downloadFailures[key] = SyncPlanner.giveUpAfter - 1
+        check("差一次到阈值，仍然要试",
+              SyncPlanner.pending(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: [:]).count, 1)
+        check("没到阈值不算放弃",
+              SyncPlanner.givenUp(entries: [e], manifest: m).count, 0)
+
+        m.downloadFailures[key] = SyncPlanner.giveUpAfter
+        check("到阈值就不再自动重试",
+              SyncPlanner.pending(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: [:]).count, 0)
+        check("到阈值应被列为已放弃（界面要能手动重试）",
+              SyncPlanner.givenUp(entries: [e], manifest: m).count, 1)
+
+        // 放弃 ≠ 删账：本地已经有完整副本时，补账这条路不能被失败计数挡住，
+        // 否则一条「下载老失败但其实早就下全了」的文件会永远补不上账。
+        check("已放弃但本地完整，照样补账",
+              SyncPlanner.unrecorded(entries: [e], manifest: m, status: nil, current: nil,
+                                     localRaw: full).count, 1)
+
+        // 人手重置（界面上点「再试一次」）之后要能重新排上
+        m.downloadFailures[key] = nil
+        check("清零之后重新排上",
+              SyncPlanner.pending(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: [:]).count, 1)
+    }
+
     // 正在录的一律不碰——哪怕本地大小恰好对上
     check("正在录的不补账",
           SyncPlanner.unrecorded(entries: [e], manifest: empty, status: 1,

@@ -1149,14 +1149,28 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     /// 就没有"这次跟上次不一致"的风险，直接绑给当前账号、起个默认名字。
     /// 需要人手确认的只有"绑过、且绑的不是当前账号"这一种情况。
     private func ensureDeviceBinding(_ target: Discovered) async -> Bool {
-        guard let brain = await ensureBrain() else {
-            phase = .failed("深脑未接通，无法确认这支笔该同步进哪个账号（请先登录）")
-            lastRun = Date()
-            return false
-        }
+        // **账号从本地读，不逼着先联网。** 2026-09-07 真实事故：这里原来先
+        // `await ensureBrain()`（要连一次网、刷新一次 token），刷新失败
+        // （refresh token 过期/失效，跟这支笔要不要绑是两回事）就直接把整轮
+        // 同步拦停、且这一支路没有 log.write——表现是"蓝牙连不上"：设备页
+        // 电量/容量永远是"—"，连接在几秒内又断开，日志里只有一串
+        // "已连接"却全都没有"同步结束"。真正的病灶是登录失效，不是蓝牙。
+        //
+        // 账号信息本来就有本地缓存（TokenStore 的 org_id/email，登录时写的），
+        // 判断"这支笔绑的账号对不对"根本不需要真的连一次网——只有"这支笔
+        // 第一次见、需要去服务端登记"这一件事才要网络，且那件事失败了
+        // 不该拖累下载。
         let peripheralId = target.peripheral.identifier.uuidString
-        let currentOrg = brain.org ?? ""
+        let currentOrg = TokenStore.get("org_id") ?? ""
         let currentEmail = DeepBrain.signedInEmail ?? "当前账号"
+
+        if currentOrg.isEmpty {
+            // 没登录：这不是"绑定"这一层该管的事——推深脑那一步（flushUploadQueue）
+            // 本来就会因为登录失效而只落盘不推，且有自己的提示。这里放行，
+            // 让下载照常进行；账号一旦登录/恢复，下次连接会正常走绑定检查。
+            log.write("绑定检查跳过：还没登录，先只下载不做账号核对")
+            return true
+        }
 
         if let bound = DeviceBinding.binding(for: peripheralId) {
             if bound.orgId == currentOrg { return true }
@@ -1174,6 +1188,15 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
 
         // 第一次见这支笔：不用弹窗打断，直接绑给当前账号——这本来就是"对"的账号，
         // 没有需要人确认的风险。名字随手起一个，用户想改的话去「设备」页改。
+        //
+        // 登记这一步才真的要连网（写 iot_devices）。**连不上不能拖累下载**——
+        // 2026-09-07 的教训就是把"要不要登记成功"和"能不能下载"绑在一起，
+        // 一次 token 刷新失败就让整条下载链路陪着一起挂。连不上就记一句日志，
+        // 下次连接自然会重试登记，这一轮照常同步。
+        guard let brain = await ensureBrain() else {
+            log.write("首次绑定「\(target.name)」暂时跳过：深脑接不通（登录可能失效了），本轮先同步，下次连接再试绑定")
+            return true
+        }
         let defaultName = "\(target.name)-\(Host.current().localizedName ?? "Mac")"
         if await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
                             deviceNo: defaultName, brain: brain) {

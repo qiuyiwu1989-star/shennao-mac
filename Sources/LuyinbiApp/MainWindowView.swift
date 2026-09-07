@@ -1,3 +1,4 @@
+import AppKit
 import LuyinbiCore
 import SwiftUI
 
@@ -159,6 +160,30 @@ struct MainWindowView: View {
                       systemImage: "arrow.up.forward")
             }
             .buttonStyle(DSSecondaryButtonStyle())
+
+            // 账号入口只在菜单栏图标里，2026-09-07 真实反馈：菜单栏图标一多
+            // 就被系统挤到看不见的地方（没有任何"还有更多"的提示），
+            // 退出登录/重新登录这种偶尔才用一次但用的时候很急的动作，
+            // 不能只有一条路能到——这里放一份完全一样的入口，不依赖菜单栏
+            // 有没有空间显示图标。
+            if let mail = model.signedInEmail {
+                Menu {
+                    Button("退出登录") {
+                        let a = NSAlert()
+                        a.messageText = "退出登录？"
+                        a.informativeText = "本机已导入的录音不会受影响，但在重新登录之前不能再推给深脑。"
+                        a.addButton(withTitle: "退出登录")
+                        a.addButton(withTitle: "取消")
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                        if a.runModal() == .alertFirstButtonReturn { model.actions.signOut() }
+                    }
+                } label: {
+                    Image(systemName: "person.crop.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("已登录：\(mail)　点开可退出登录")
+            }
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
     }

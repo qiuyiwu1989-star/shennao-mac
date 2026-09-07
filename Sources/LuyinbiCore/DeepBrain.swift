@@ -261,6 +261,16 @@ public final class DeepBrain {
                 "深脑那边这条会话是 failed 状态（\(sid)）。它挡着重传——"
                 + "换一个幂等键重推，或先在深脑里删掉这条会话。")
         }
+        // 「stop 成功但 finalize 失败」这种半途状态，2026-09-07 的 code review 提过一次，
+        // 但对着服务端状态机核过之后**不成立，故意不加处理**——记在这里免得下次
+        // 又有人想当然地"修"它：
+        //   · stop 作用在 recording 上 → 状态变 uploading（同时冻结时长与分片数）
+        //   · uploading **仍在**下面那个白名单里，所以早退分支不会触发；
+        //     重试会正常重传分片（409 CHUNK_ALREADY_VERIFIED 被吞）、重发 stop
+        //     （值一致 → 服务端判 replay）、再 finalize（uploading → queued）
+        //   · finalize 作用在 queued/finalizing/ready 上一律是 replay，重复调用无害
+        // 也就是说这条路本来就是自愈的。真正的坑在 failed：那个状态挡着重传，
+        // 出口是 repushFailed 换一个带轮次后缀的幂等键，而轮次只存在内存里（重启即丢）。
         if !["recording", "uploading"].contains(existing) {
             onStep?("会话已是 \(existing)，无需重传")
             return UploadResult(sessionId: sid, chunks: session["expected_chunk_count"] as? Int ?? 0,

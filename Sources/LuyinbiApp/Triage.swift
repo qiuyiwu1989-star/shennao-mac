@@ -14,6 +14,11 @@ enum Triage {
         case needsSpeaker  // 转写好了但没指认说话人
         case stuck         // 上传失败/卡住
         case working       // 正在搬运
+        /// 正在录音笔上录着，本轮故意跳过。**最正常的状态，绝不是故障。**
+        case liveOnDevice
+        /// 只在设备上、还没导进来。以前它会掉进 working 的兜底分支，
+        /// 显示成「正在处理」——而根本没有任何人在处理它（2026-09-07 review）。
+        case onDeviceOnly
         case skipped       // 太短，按规则只落盘没推
         case pendingDel    // 排队等着从设备删
         case done          // 一切正常
@@ -26,6 +31,8 @@ enum Triage {
             case .queued:       return "排队等推送"
             case .working:      return "正在进行"
             case .skipped:      return "太短未推送"
+            case .liveOnDevice: return "录音笔正在录"
+            case .onDeviceOnly: return "还在录音笔上"
             case .pendingDel:   return "等着从设备删"
             case .done:         return "已完成"
             }
@@ -38,6 +45,8 @@ enum Triage {
             case .queued:       return "arrow.up.circle"
             case .working:      return "arrow.down.circle"
             case .skipped:      return "clock.badge.questionmark"
+            case .liveOnDevice: return "record.circle"
+            case .onDeviceOnly: return "externaldrive"
             case .pendingDel:   return "trash"
             case .done:         return "checkmark.circle.fill"
             }
@@ -51,6 +60,9 @@ enum Triage {
             // 排队和「正在进行」同色：它们是同一件事的两个阶段，不是两种状态。
             case .queued:       return DS.focusBright
             case .skipped:      return DS.ink300
+            // 这两个都不是「进行中」，不能用那个蓝——用中性色，别喊。
+            case .liveOnDevice: return DS.ink300
+            case .onDeviceOnly: return DS.ink300
             case .pendingDel:   return DS.warn
             case .done:         return DS.ok
             }
@@ -64,6 +76,8 @@ enum Triage {
             case .queued:       return "在上传队列里等着，轮到就推"
             case .working:      return "正在搬，等着就行"
             case .skipped:      return "本地留着了，需要的话可以手动推给深脑"
+            case .liveOnDevice: return "录完自己就会同步，不用管"
+            case .onDeviceOnly: return "等录音笔连上就会自动导入"
             case .pendingDel:   return "设备下次连上就删"
             case .done:         return ""
             }
@@ -73,6 +87,12 @@ enum Triage {
     static func classify(_ item: RecordingItem, busyBase: String?) -> Kind {
         if item.pendingDeviceDelete { return .pendingDel }
         if item.base == busyBase { return .working }
+        // **「正在录」必须排在 lastError 之前判。**
+        // 引擎给正在录的那条塞的是 lastError = "录音中，本次跳过"，而下面那条
+        // 「有 lastError 就算 stuck」会把它渲染成「推送卡住」、还计进顶部的
+        // 「卡住 N」和待办里——**录音笔最正常的状态被呈现成最该去修的东西**
+        // （2026-09-07 review）。
+        if item.lastError?.contains("录音中") == true { return .liveOnDevice }
         // 太短是「按你定的规则跳过」，不是故障——不能混进待办里让人以为出了问题
         if item.skippedShortSeconds != nil && !item.inBrain { return .skipped }
         if item.brainStatus == "failed" { return .failed }
@@ -85,6 +105,9 @@ enum Triage {
             return item.uploadAttempts > 0 ? .stuck : .queued
         }
         if item.inBrain { return .done }
+        // 只在设备上、没落盘、没会话：**没有任何人在处理它**，等下一轮同步。
+        // 兜底到 working（"正在处理"）是在撒谎，而且用的还是进行中那个蓝色。
+        if item.onDevice && !item.onDisk { return .onDeviceOnly }
         return .working
     }
 

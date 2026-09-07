@@ -1,25 +1,26 @@
 import SwiftUI
 import LuyinbiCore
 
-/// 左侧三个入口。
+/// 左侧两个入口。
 ///
 /// 之前一个窗口里挤着三件不相干的事：同步来的内容、录音笔的状态、以及要新录的音。
 /// 它们被硬塞进同一套「列表 + 工作台」里——录音笔的电量和容量只好挤在顶栏，
 /// 而顶栏本该放当前这条录音的动作。结果是每一处都在替另一处让位。
 ///
-/// 拆成三块之后，每块只回答一个问题：
-///   · 内容 —— 我攒下了什么
+/// 拆开之后，每块只回答一个问题：
+///   · 内容 —— 我攒下了什么、每一条走到哪一步了
 ///   · 设备 —— 录音笔现在什么状况
-///   · 录音 —— 现在开录
+///
+/// 「录音」那一块按 spec 012 砍掉了：CB08 是专用硬件、手机也能录，
+/// Mac 坐在桌上当录音笔的场景不成立。
 enum RailSection: String, CaseIterable, Identifiable {
-    case library, device, record
+    case library, device
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .library: return "内容"
         case .device:  return "设备"
-        case .record:  return "录音"
         }
     }
 
@@ -27,7 +28,6 @@ enum RailSection: String, CaseIterable, Identifiable {
         switch self {
         case .library: return "square.stack"
         case .device:  return "dot.radiowaves.left.and.right"
-        case .record:  return "mic"
         }
     }
 }
@@ -35,8 +35,6 @@ enum RailSection: String, CaseIterable, Identifiable {
 struct SideRail: View {
     @Environment(\.colorScheme) private var scheme
     @Binding var section: RailSection
-    /// 待认人条数。有事要做才亮，没事不打扰。
-    let pending: Int
     /// 设备连着没有。红点比一行字更早被看见。
     let deviceConnected: Bool
 
@@ -74,11 +72,6 @@ struct SideRail: View {
     @ViewBuilder
     private func badge(for s: RailSection) -> some View {
         switch s {
-        case .library where pending > 0:
-            Text("\(pending)")
-                .font(DS.bodyFont(DS.T.micro, .semibold)).foregroundStyle(.white)
-                .padding(.horizontal, 5).padding(.vertical, 1)
-                .background(Capsule().fill(DS.focus))
         case .device:
             Circle()
                 .fill(deviceConnected ? DS.ok : DS.glyph)
@@ -91,9 +84,8 @@ struct SideRail: View {
     /// 读屏要念出「为什么这里有个点」，光念「设备」等于没说。
     private func voiceOver(_ s: RailSection) -> String {
         switch s {
-        case .library: return pending > 0 ? "内容，\(pending) 条待认人" : "内容"
+        case .library: return "内容"
         case .device:  return deviceConnected ? "设备，录音笔已连接" : "设备，录音笔未连接"
-        case .record:  return "录音"
         }
     }
 }

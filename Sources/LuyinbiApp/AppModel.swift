@@ -24,7 +24,6 @@ struct AppActions {
     /// 上传前定标题与项目。已推上去的不生效（引擎侧也挡着）。
     var setPlan: @MainActor (RecordingItem, String?, String?) -> Void = { _, _, _ in }
     var runAudit: @MainActor () -> Void = {}
-    var rebuildSearchIndex: @MainActor () -> Void = {}
     /// 手动推给深脑（无视时长门槛）
     var pushNow: @MainActor (RecordingItem) -> Void = { _ in }
     /// 这条从设备删掉会丢什么——弹确认框之前要问
@@ -88,19 +87,14 @@ final class AppModel: ObservableObject {
     /// 深脑站点。接真引擎时应由引擎的配置覆盖这一行。
     var brainBaseURL = URL(string: "https://shennao.zaowuyun.com")!
     /// 清理开关的界面镜像。真值在引擎里，这里只用于显示。
-    /// 本地试听器。放在 model 上，切换选中行时也能继续播。
-    let audio = AudioPreview()
-    let speakers = SpeakerStore()
-    let search = LocalSearchStore()
     /// 哪个大面板开着。nil = 正常工作台。
     @Published var panel: Panel?
-    enum Panel { case search, bulkNaming, audit }
+    enum Panel { case audit }
     /// 归档体检结果，菜单和面板共用
     @Published var auditReport: ArchiveAudit.Report?
     /// 已登录的深脑客户端，说话人指认要用。接引擎时填上。
+    /// 已登录的深脑客户端。登录/退出要用。
     @Published var brain: DeepBrain?
-    /// 深脑里的项目，供上传前归类。懒加载，拿不到就空着不挡路。
-    @Published var projects: [(id: String, name: String)] = []
     @Published var cleanupEnabled = false
     @Published var coolingDays = 3
     @Published var minUploadMinutes = 5
@@ -126,14 +120,6 @@ final class AppModel: ObservableObject {
         })
     }
 
-    func selectAndPlay(base: String, seconds: Double) {
-        guard let item = items.first(where: { $0.base == base }) else { return }
-        selection = item.id
-        panel = nil            // 关掉搜索面板，回到工作台看上下文
-        audio.toggle(base: base,
-                     url: importFolder.appendingPathComponent("\(base).ogg"),
-                     startAt: seconds)
-    }
 
     func applyBrainTitle(base: String, title: String) {
         guard let i = items.firstIndex(where: { $0.base == base }) else { return }
@@ -190,7 +176,7 @@ final class AppModel: ObservableObject {
 
     // MARK: - 接引擎
 
-    /// 换数据源就调这一个方法。PreviewEngine 和真 SyncEngine 走同一条路。
+    /// 换数据源就调这一个方法。
     func attach(_ newEngine: (any SyncEngineObserving)?) {
         engine = newEngine
         pull(force: true)

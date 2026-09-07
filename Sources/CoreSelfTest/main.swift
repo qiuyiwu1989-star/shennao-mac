@@ -153,7 +153,7 @@ do {
                               localRaw: full).count, 0)
     check("本地完整应被补账",
           SyncPlanner.unrecorded(entries: [e], manifest: empty, status: nil, current: nil,
-                                 localRaw: full).count, 1)
+                                 localRaw: full, localOgg: ["note20260829-140354"]).count, 1)
 
     // 少一个字节 → 必须重下，绝不补账
     let short = ["note20260829-140354": 21_601_999]
@@ -162,19 +162,19 @@ do {
                               localRaw: short).count, 1)
     check("差一个字节不许补账",
           SyncPlanner.unrecorded(entries: [e], manifest: empty, status: nil, current: nil,
-                                 localRaw: short).count, 0)
+                                 localRaw: short, localOgg: ["note20260829-140354"]).count, 0)
 
     // 大小对得上但除不尽 40（不可能是完整的裸包）→ 不补账
     let odd = entry("x.", 2, 101)
     check("除不尽 40 不许补账",
           SyncPlanner.unrecorded(entries: [odd], manifest: empty, status: nil, current: nil,
-                                 localRaw: ["x": 101]).count, 0)
+                                 localRaw: ["x": 101], localOgg: ["x"]).count, 0)
 
     // 0 字节不算完整
     let zero = entry("z.", 0, 0)
     check("0 字节不算完整",
           SyncPlanner.unrecorded(entries: [zero], manifest: empty, status: nil, current: nil,
-                                 localRaw: ["z": 0]).count, 0)
+                                 localRaw: ["z": 0], localOgg: ["z"]).count, 0)
 
     // ── 僵尸条目：连续失败够多次就不再自动重试 ─────────────────────────
     // 实测过一条设备报着、一下就回 0 字节的文件，9 天里被自动重试了 97 次，
@@ -201,7 +201,7 @@ do {
         // 否则一条「下载老失败但其实早就下全了」的文件会永远补不上账。
         check("已放弃但本地完整，照样补账",
               SyncPlanner.unrecorded(entries: [e], manifest: m, status: nil, current: nil,
-                                     localRaw: full).count, 1)
+                                     localRaw: full, localOgg: ["note20260829-140354"]).count, 1)
 
         // 人手重置（界面上点「再试一次」）之后要能重新排上
         m.downloadFailures[key] = nil
@@ -213,14 +213,122 @@ do {
     // 正在录的一律不碰——哪怕本地大小恰好对上
     check("正在录的不补账",
           SyncPlanner.unrecorded(entries: [e], manifest: empty, status: 1,
-                                 current: "note20260829-140354.", localRaw: full).count, 0)
+                                 current: "note20260829-140354.", localRaw: full,
+                                 localOgg: ["note20260829-140354"]).count, 0)
 
     // 已经记过账的不重复补
     empty.imported[SyncPlanner.manifestKey(e)] =
         SyncManifest.Imported(file: "a.ogg", bytes: 1, at: "x")
     check("已记账的不重复补",
           SyncPlanner.unrecorded(entries: [e], manifest: empty, status: nil, current: nil,
-                                 localRaw: full).count, 0)
+                                 localRaw: full, localOgg: ["note20260829-140354"]).count, 0)
+}
+
+// MARK: - 裸包在、ogg 不在：本地重封，不许当成「已导入」
+//
+// 2026-09-07 code review：落盘那段是先写裸包、再封 ogg。封装那步失败时直接 continue，
+// 裸包留在磁盘上、清单没记。下一轮补账只看裸包完整就记一条 `<base>.ogg` 的账——
+// 断言了一个从没写成功的文件。此后 pending 因「已记账」跳过它、
+// scanUploadable 因「没有 ogg」找不到它：音频还在，但自动路径里再没有东西会碰它。
+print("\n裸包在但 ogg 缺失")
+do {
+    func entry(_ name: String, _ secs: UInt32, _ size: UInt32) -> FileEntry {
+        FileEntry(time: secs, size: size, name: name, rawName: Array(name.utf8))
+    }
+    let e = entry("note20260829-140354.", 10801, 21_602_000)
+    let m = SyncManifest()
+    let raw = ["note20260829-140354": 21_602_000]
+
+    check("ogg 不在 → 不许补账（那是在断言一个不存在的文件）",
+          SyncPlanner.unrecorded(entries: [e], manifest: m, status: nil, current: nil,
+                                 localRaw: raw, localOgg: []).count, 0)
+    check("ogg 不在 → 应该走重封",
+          SyncPlanner.needsRewrap(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: raw, localOgg: []).count, 1)
+    check("ogg 在 → 就是普通补账，不重封",
+          SyncPlanner.needsRewrap(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: raw, localOgg: ["note20260829-140354"]).count, 0)
+    check("裸包不完整 → 两条路都不走（该重下）",
+          SyncPlanner.needsRewrap(entries: [e], manifest: m, status: nil, current: nil,
+                                  localRaw: ["note20260829-140354": 21_601_999],
+                                  localOgg: []).count, 0)
+    check("正在录的不重封",
+          SyncPlanner.needsRewrap(entries: [e], manifest: m, status: 1,
+                                  current: "note20260829-140354.",
+                                  localRaw: raw, localOgg: []).count, 0)
+}
+
+// MARK: - 读不到设备状态时，「不碰正在录的那条」必须失效朝安全那边倒
+//
+// 2026-09-07 code review：原来第一行是 `guard let current else { return false }`，
+// 也就是「读不到当前在录哪个」=「没有正在录的」。而 readDeviceInfo 用 try? 吞掉失败，
+// 27KB/s 链路上 4 秒超时很常见。一次丢包就解除这道闸 → 拉到半截 →
+// 字节数与设备当时声称的一致，下载完整性硬闸也拦不住（它内部自洽，只是短）→
+// 以 mac-ble-<base> 推上去并 finalize → 完整版永远进不去。
+print("\n设备状态读不全时的失效方向")
+do {
+    func entry(_ name: String, _ secs: UInt32, _ size: UInt32) -> FileEntry {
+        FileEntry(time: secs, size: size, name: name, rawName: Array(name.utf8))
+    }
+    let e = entry("note20260907-153127.", 900, 1_800_000)
+    let m = SyncManifest()
+
+    check("说在录、但说不出录哪个 → 全拦",
+          SyncPlanner.pending(entries: [e], manifest: m, status: 1, current: nil).count, 0)
+    check("暂停中、也说不出录哪个 → 全拦",
+          SyncPlanner.pending(entries: [e], manifest: m, status: 3, current: nil).count, 0)
+    // status 也读不到时**不拦**：分不清「这次读失败」和「这个固件不实现 3-20」，
+    // 一律拦会让老固件永远同步不了——为了防一种丢失而制造彻底不可用，是更坏的交易。
+    // 这一路交给 readDeviceInfo 记日志，不在这里做判断。
+    check("两个都读不到 → 放行（否则老固件永远同步不了）",
+          SyncPlanner.pending(entries: [e], manifest: m, status: nil, current: nil).count, 1)
+    check("明确说了没在录 → 放行（这是正常情况，不能误伤）",
+          SyncPlanner.pending(entries: [e], manifest: m, status: 2, current: nil).count, 1)
+    check("在录别的那条 → 这条放行",
+          SyncPlanner.pending(entries: [e], manifest: m, status: 1,
+                              current: "note20260907-999999.").count, 1)
+    check("在录的就是这条 → 拦",
+          SyncPlanner.pending(entries: [e], manifest: m, status: 1,
+                              current: "note20260907-153127.").count, 0)
+}
+
+// MARK: - 清单读不出来时，绝不许把空账本写回去
+//
+// 2026-09-07 code review：load 把「文件不存在」「读不到」「半截 JSON」压成同一个空清单，
+// 而每个写入点都是 load → 改一个键 → .atomic save，于是空清单被原子地永久写回。
+// Python 版 pull.py 写同一个文件用的是 write_text（先截断再写），
+// Swift 只要在那个窗口读一次就会撞上。
+print("\n清单读失败不许覆盖")
+do {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("manifest-test-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let url = dir.appendingPathComponent("manifest.json")
+
+    // 文件不存在 = 首次运行，这种空清单是可信的
+    let fresh = SyncManifest.load(from: url)
+    check("文件不存在 → 可信", fresh.isTrustworthy, true)
+    var seeded = fresh
+    seeded.imported["k"] = SyncManifest.Imported(file: "a.ogg", bytes: 1, at: "t")
+    seeded.uploaded["a"] = "session-1"
+    check("首次运行可以正常写", (try? seeded.save(to: url)) != nil, true)
+
+    // 半截 JSON（正是 Python 非原子写的那个窗口）
+    try? Data("{\"imported\": {\"k\": {\"file\"".utf8).write(to: url)
+    let poisoned = SyncManifest.load(from: url)
+    check("半截 JSON → 不可信", poisoned.isTrustworthy, false)
+    check("不可信的清单拒绝保存", (try? poisoned.save(to: url)) == nil, true)
+
+    // 关键断言：磁盘上那份没有被空清单覆盖掉
+    let after = try? Data(contentsOf: url)
+    check("磁盘上的内容没有被空清单抹掉", (after?.count ?? 0) > 0, true)
+
+    // 修好之后照常读写
+    check("重新写入好的清单可以恢复", (try? seeded.save(to: url)) != nil, true)
+    let recovered = SyncManifest.load(from: url)
+    check("恢复后账目还在", recovered.uploaded["a"] ?? "", "session-1")
+    check("恢复后可信", recovered.isTrustworthy, true)
 }
 
 // MARK: - 下载完整性硬闸
@@ -252,6 +360,42 @@ do {
 // 录音笔有 3 小时上限，到点自动断开、隔 1 秒开下一条。实测 2026-08-29：
 // 14:03:54 录 3:00:01，17:03:56 接着录 13:16，中间只差 1 秒——同一场会。
 // 判宽了会把两场独立会议粘成一条（正文串了、比切开糟得多），所以判据要严。
+// MARK: - wav 不能用裸包的判据去卡
+//
+// 2026-09-07 code review：下载候选名里 .opus 之后就是 .wav（FileEntry.candidates），
+// 设备真吐 wav 时，长度是任意的。而完整性硬闸原来无差别地要求 %40==0：
+//   · 39/40 的概率 → 完好的文件被判「不完整」，重试五次进「放弃」名单
+//     （很可能就是那条 9 天试了 97 次的僵尸条目）
+//   · 剩下 1/40 → looksRaw 只排除 OggS，RIFF 不是 OggS 所以判成裸包，
+//     wav 被塞进 wrap() 封成 Ogg/Opus——推上去的是一段垃圾，本地还看着正常
+print("\nwav 与裸包的判据要分开")
+do {
+    check("裸包：除不尽 40 仍算不完整", SyncPlanner.downloadComplete(got: 101, announced: 101), false)
+    check("裸包：整除且相等才算完整", SyncPlanner.downloadComplete(got: 120, announced: 120), true)
+    check("wav：除不尽 40 也算完整（长度本来就是任意的）",
+          SyncPlanner.downloadComplete(got: 101, announced: 101, isRawOpus: false), true)
+    check("wav：字节数对不上照样不完整（这条不能松）",
+          SyncPlanner.downloadComplete(got: 100, announced: 101, isRawOpus: false), false)
+    check("wav：0 字节不算完整",
+          SyncPlanner.downloadComplete(got: 0, announced: 0, isRawOpus: false), false)
+
+    // looksRaw 必须正面识别，不能只排除 OggS
+    func bytes(_ head: String, pad: Int) -> [UInt8] {
+        var d = Array(head.utf8); d += [UInt8](repeating: 0, count: pad - d.count); return d
+    }
+    var wav = bytes("RIFF", pad: 8) + Array("WAVE".utf8)
+    wav += [UInt8](repeating: 0, count: 40 - wav.count % 40)   // 凑成 40 的整数倍
+    check("长度整除 40 的 wav 不许被当成裸包", OggWrap.looksRaw(wav), false)
+    check("wav 被认成已知容器", OggWrap.isKnownContainer(wav), true)
+
+    let ogg = bytes("OggS", pad: 80)
+    check("Ogg 不是裸包", OggWrap.looksRaw(ogg), false)
+
+    let raw = [UInt8](repeating: 0x41, count: 400)
+    check("真裸包仍判为裸包", OggWrap.looksRaw(raw), true)
+    check("真裸包不是已知容器", OggWrap.isKnownContainer(raw), false)
+}
+
 print("\n设备切分识别")
 do {
     let capped = 10801.0          // 顶满上限

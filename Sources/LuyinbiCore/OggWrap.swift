@@ -91,8 +91,30 @@ public enum OggWrap {
         Double(rawLength / packetLen * frameMs) / 1000
     }
 
+    /// 这堆字节像不像「设备直接吐出来的裸 opus 包」。
+    ///
+    /// **必须正面识别，不能只排除 OggS。** 2026-09-07 code review：
+    /// 原来的判据是「长度是 40 的整数倍，且开头不是 OggS」。而下载候选名里
+    /// 除了 `.opus` 还有 `.wav`（FileEntry.candidates），设备真吐 wav 时——
+    /// 只要它的长度碰巧被 40 整除（1/40 的概率）——RIFF ≠ OggS，于是被判成裸 opus，
+    /// 塞进 wrap() 封成一个 Ogg/Opus 流。**推上去的是一段垃圾**，
+    /// 而本地看起来一切正常。
+    ///
+    /// 现在把已知的容器头都排除掉：认识的容器一律不当裸包。
     public static func looksRaw(_ data: [UInt8]) -> Bool {
-        data.count >= packetLen && data.count % packetLen == 0
-            && Array(data.prefix(4)) != Array("OggS".utf8)
+        guard data.count >= packetLen, data.count % packetLen == 0 else { return false }
+        return !isKnownContainer(data)
+    }
+
+    /// 认得出的容器格式。认出来了就说明它不是裸包，该原样落盘。
+    public static func isKnownContainer(_ data: [UInt8]) -> Bool {
+        func magic(_ s: String, at i: Int = 0) -> Bool {
+            let m = Array(s.utf8)
+            guard data.count >= i + m.count else { return false }
+            return Array(data[i..<(i + m.count)]) == m
+        }
+        // WAV: "RIFF"...."WAVE"；Ogg: "OggS"；CAF: "caff"；M4A/MP4: ....ftyp
+        return magic("OggS") || magic("caff") || (magic("RIFF") && magic("WAVE", at: 8))
+            || magic("ftyp", at: 4)
     }
 }

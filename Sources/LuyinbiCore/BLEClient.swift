@@ -146,15 +146,61 @@ public final class BLEClient: NSObject, @unchecked Sendable {
         p.delegate = self
         // 回调一律在锁外发（prepareForConnect 里已经解锁）
         for f in prepareForConnect(p) { f() }
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            lock.lock(); connectWaiter = { r in c.resume(with: r) }; lock.unlock()
-            central.connect(p, options: nil)
-        }
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            lock.lock(); discoverWaiter = { r in c.resume(with: r) }; lock.unlock()
+        // **这两步都必须有超时。**
+        //
+        // `central.connect` 在 CoreBluetooth 里没有默认超时——连不上就一直挂着，
+        // 既不回 didFailToConnect，也不会走 didDisconnectPeripheral（连接从没建立过，
+        // 谈不上断开），所以 handleDisconnect 里那个「叫醒所有等待者」的兜底也够不着它。
+        // 而 CB08 空闲 7–8 分钟就停止广播，「广播被收到 → 我们发起连接」之间它正好睡着
+        // 是**常态竞态**，不是边角情况。
+        //
+        // 挂住的后果不止这一次同步失败：runSync 永远停在这里且 isSyncing 一直是 true，
+        // 于是监听循环跳过每一个广播、补推循环每轮都被 `guard !isSyncing` 挡掉、
+        // 手动「立即同步」回一句「正在同步中」——**整个 App 静默停摆，直到重启**，
+        // 而界面上 phase 就冻在「连接中」。
+        //
+        // 服务发现同理：AE21 找到了但没有 AE22/AE23 特征时，didUpdateNotificationStateFor
+        // 永远不来，finishDiscover 也就永远不被调用。
+        try await withTimeout(seconds: Self.connectTimeout, peripheral: p,
+                              what: "连接") { [weak self] c in
+            self?.lock.lock(); self?.connectWaiter = { r in c(r) }; self?.lock.unlock()
+            self?.central.connect(p, options: nil)
+        } onTimeout: { [weak self] in self?.finishConnect(.failure(
+            BLEError.connectFailed("连接超时（\(Int(Self.connectTimeout))s 内没有回应，多半是笔已经睡了）"))) }
+
+        try await withTimeout(seconds: Self.discoverTimeout, peripheral: p,
+                              what: "服务发现") { [weak self] c in
+            self?.lock.lock(); self?.discoverWaiter = { r in c(r) }; self?.lock.unlock()
             p.discoverServices([CBUUID(string: Proto.serviceMain)])
-        }
+        } onTimeout: { [weak self] in self?.finishDiscover(.failure(
+            BLEError.connectFailed("服务发现超时（\(Int(Self.discoverTimeout))s 内没有拿到 AE22 通知）"))) }
+
         mtu = p.maximumWriteValueLength(for: .withoutResponse) + 3
+    }
+
+    /// 连接与服务发现的超时上限。10 秒：真机上正常连接实测 1–3 秒，
+    /// 给到 10 秒足够覆盖信号差的情况，又不至于让一次「笔已经睡了」拖住整个引擎。
+    private static let connectTimeout: TimeInterval = 10
+    private static let discoverTimeout: TimeInterval = 10
+
+    /// 带超时的续体包装。
+    ///
+    /// 超时回调走 `finishConnect`/`finishDiscover`，它们在锁内把 waiter 取出并置 nil，
+    /// 所以「成功之后超时才触发」只是拿到一个 nil、什么都不做——不会重复 resume
+    /// （CheckedContinuation 被 resume 两次是直接崩溃，不是警告）。
+    private func withTimeout(seconds: TimeInterval, peripheral p: CBPeripheral, what: String,
+                             _ arm: @escaping (@escaping (Result<Void, Error>) -> Void) -> Void,
+                             onTimeout: @escaping () -> Void) async throws {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            arm { r in c.resume(with: r) }
+            queue.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                guard let self else { return }
+                onTimeout()
+                // 请求本身也要撤掉，否则系统会一直替我们排队等这台设备，
+                // 下一轮再 connect 时可能复用这条半死的请求。
+                self.central.cancelPeripheralConnection(p)
+            }
+        }
     }
 
     /// 主动断开。签名保持同步不变（上层在 defer 里调，await 不了）。

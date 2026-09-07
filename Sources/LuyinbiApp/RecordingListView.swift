@@ -182,6 +182,8 @@ struct RecordingListView: View {
         case .queued:       return "排队等推送"
         case .skipped:      return "太短未推"
         case .pendingDel:   return "等着删除"
+        case .liveOnDevice: return "正在录"
+        case .onDeviceOnly: return "在录音笔上"
         case .done:         return "已入深脑"
         }
     }

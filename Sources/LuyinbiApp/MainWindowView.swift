@@ -2,21 +2,21 @@ import AppKit
 import LuyinbiCore
 import SwiftUI
 
-/// 主窗口：顶部设备条 + 左侧录音列表 + 右侧工作台。
+/// 主窗口：顶部动作条 + 左侧录音清单 + 右侧台账详情。
 ///
-/// 划分标准只有一条：**需要音频本身或需要碰设备的，放这里；只需要文本的，去深脑网页。**
-/// 所以这里有播放器、波形、逐句转写、说话人指认、设备管理；
-/// 没有总结、要点、思维导图、标签、项目空间——那些网页做得更好，两边各做一遍是白费。
+/// spec 012：这个 App 只做一件事——把录音从笔里弄进深脑。
+/// **浏览、播放、认人、搜索一律不做**，网页已经做了，原生复刻只会长期落后于它。
+/// 所以右侧是台账（走到哪一步、卡住的话卡在哪），不是阅读器。
 struct MainWindowView: View {
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var model: AppModel
 
-    private var pendingSpeakers: Int {
-        model.items.filter { $0.transcriptId != nil && $0.unconfirmedSpeakers > 0 }.count
-    }
 
+    /// **不回退到 items.first。** 原来「没选中就显示最新一条」会造成
+    /// 右侧有内容、左侧无高亮；而且导入新录音时 item.id 变化会触发 reload、
+    /// 打断正在播放的那条（2026-09-07 review）。没选就是没选。
     private var selected: RecordingItem? {
-        model.items.first { $0.id == model.selection } ?? model.items.first
+        model.items.first { $0.id == model.selection }
     }
 
     @State private var section: RailSection = .library
@@ -32,8 +32,7 @@ struct MainWindowView: View {
             if let panel = model.panel {
                 panelView(panel)
             } else if let item = selected {
-                WorkbenchView(model: model, store: model.speakers,
-                              audio: model.audio, item: item)
+                RecordingDetailView(model: model, item: item)
             } else {
                 EmptyHint(icon: "waveform", title: "还没有录音",
                           detail: "把录音笔开机放在旁边，它一广播就会自动导入")
@@ -52,14 +51,13 @@ struct MainWindowView: View {
             if let blocked = model.uploadBlocked { blockedBanner(blocked) }
             Divider()
             HStack(spacing: 0) {
-                SideRail(section: $section, pending: pendingSpeakers,
+                SideRail(section: $section,
                          deviceConnected: model.device.connected)
                     .frame(width: 132)
                 Divider()
                 switch section {
                 case .library: librarySplit
                 case .device:  DevicePage(model: model)
-                case .record:  RecordPage(model: model)
                 }
             }
         }
@@ -67,30 +65,11 @@ struct MainWindowView: View {
         .background(DS.bg(scheme == .dark))
     }
 
-    /// 大面板覆盖工作台而不是弹窗：搜索和批量指认都是「要待一会儿」的任务，
-    /// 弹窗压着主界面反而碍事，而且弹窗里放不下这么多内容。
+    /// 归档体检还是要盖住右侧——它是「要待一会儿」的任务，弹窗放不下。
     @ViewBuilder
     private func panelView(_ panel: AppModel.Panel) -> some View {
         switch panel {
-        case .search:
-            SearchView(store: model.search,
-                       onPick: { base, secs in model.selectAndPlay(base: base, seconds: secs) },
-                       onRebuild: { model.actions.rebuildSearchIndex() })
-        case .bulkNaming:
-            if let brain = model.brain {
-                BulkNamingView(items: model.items.filter {
-                                   $0.transcriptId != nil && $0.unconfirmedSpeakers > 0
-                               },
-                               brain: brain, audio: model.audio,
-                               audioFolder: model.importFolder,
-                               onClose: { model.panel = nil })
-            } else {
-                EmptyHint(icon: "person.2.slash", title: "还没接通深脑",
-                          detail: "登录之后才能指认说话人")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        case .audit:
-            ArchiveAuditPanel(model: model)
+        case .audit: ArchiveAuditPanel(model: model)
         }
     }
 
@@ -134,34 +113,12 @@ struct MainWindowView: View {
                 StatusPill(text: "正在录音", tone: .warn)
             }
 
-            Button {
-                model.panel = model.panel == .search ? nil : .search
-            } label: {
-                Image(systemName: "magnifyingglass").font(.system(size: 13))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(model.panel == .search ? DS.focusBright : DS.body(scheme == .dark))
-            .help("搜索本机录音的转写内容")
 
-            // 有待认人的才显示这个入口——没事的时候不该占位置。
-            //
-            // 谁当主按钮取决于「此刻有没有事要人做」，不是固定的：
-            // 同步是自动的、会自己发生；待认人是**只有人能干**、不认就一直挂着。
-            // 把最重的渐变常年给同步，等于每次开窗最亮的那个东西都在说
-            // 「点我做一件本来就会自动发生的事」，而真正等人的那件是灰的。
-            if pendingSpeakers > 0 {
-                Button { model.panel = model.panel == .bulkNaming ? nil : .bulkNaming } label: {
-                    Label("认人 \(pendingSpeakers)", systemImage: "person.2.wave.2")
-                }
-                .buttonStyle(DSPrimaryButtonStyle())
-                .help("有 \(pendingSpeakers) 条录音还不知道谁在说话")
-            }
 
             Button { model.actions.syncNow() } label: {
                 Label("立即同步", systemImage: "arrow.triangle.2.circlepath")
             }
-            .buttonStyle(pendingSpeakers > 0 ? AnyButtonStyleBox(DSSecondaryButtonStyle())
-                                             : AnyButtonStyleBox(DSPrimaryButtonStyle()))
+            .buttonStyle(DSPrimaryButtonStyle())
             .disabled(model.isBusy)
             .help(model.isBusy ? "正在同步中" : "立刻扫一次录音笔并导入新录音")
 

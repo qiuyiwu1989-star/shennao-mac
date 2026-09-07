@@ -35,12 +35,6 @@ final class AppState {
         model.actions.runAudit = { [engine, weak model] in
             model?.auditReport = engine.runArchiveAudit()
         }
-        model.actions.rebuildSearchIndex = { [engine, weak model] in
-            guard let model, let brain = model.brain else { return }
-            model.search.rebuild(brain: brain,
-                                 manifest: SyncManifest.load(from: engine.paths.manifest),
-                                 transcriptIds: model.transcriptIdMap)
-        }
         model.actions.openLog = { [engine] in NSWorkspace.shared.open(engine.paths.syncLog) }
         model.actions.checkSession = { [engine] in
             guard let cfg = try? DeepBrainConfig.load(from: engine.paths.deepBrainConfig) else { return .none }

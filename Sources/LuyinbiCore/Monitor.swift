@@ -106,16 +106,57 @@ public struct SyncManifest: Codable, Equatable, Sendable {
         downloadFailures = (try? c.decode([String: Int].self, forKey: .downloadFailures)) ?? [:]
     }
 
+    /// 这份清单是不是「读出来的」而不是「凭空造的」。
+    ///
+    /// **读不出来 ≠ 没有。** 2026-09-07 code review 抓到：原来 load 把三种情况
+    /// 压成同一个空清单——文件不存在（首次运行，正确）、读不到（iCloud 驱逐 /
+    /// 权限 / 瞬时故障）、解码失败（半截 JSON）。而每个写入点都是
+    /// 「load → 改一个键 → .atomic save」，于是**空清单会被原子地永久写回去**，
+    /// imported / uploaded / deleted / starred / plan / downloadFailures 一次全没。
+    ///
+    /// 这不是假想：Python 版 `pull.py` 写同一个文件用的是 `write_text`（先截断再写），
+    /// Swift 只要在那个窗口读一次就会拿到半截 JSON。逐键容错解码器
+    /// （`init(from:)`）正是为了防这一类丢失才写的，而 load 从它外面绕了过去。
+    ///
+    /// false = 这份是「读失败之后的空壳」，**任何人都不许拿它去覆盖磁盘**。
+    public private(set) var isTrustworthy = true
+
+    /// 磁盘上根本没有这个文件（首次运行）。这种空清单是可信的，可以正常写。
+    public static func fresh() -> SyncManifest { SyncManifest() }
+
     public static func load(from url: URL) -> SyncManifest {
-        guard let data = try? Data(contentsOf: url) else { return SyncManifest() }
-        return (try? JSONDecoder().decode(SyncManifest.self, from: data)) ?? SyncManifest()
+        guard FileManager.default.fileExists(atPath: url.path) else { return fresh() }
+        guard let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode(SyncManifest.self, from: data) else {
+            var poisoned = SyncManifest()
+            poisoned.isTrustworthy = false
+            return poisoned
+        }
+        return decoded
+    }
+
+    public enum SaveError: Error, CustomStringConvertible {
+        case refusedUntrustworthy
+        public var description: String {
+            "拒绝保存：这份清单来自一次失败的读取，写回去会把整本账抹掉"
+        }
     }
 
     public func save(to url: URL) throws {
+        // 拒绝把「读失败造出来的空壳」写回磁盘。宁可这一轮什么都不记，
+        // 也不能把已导入/已上传/已删除的全部记录换成空的——
+        // 后者的代价是整台设备按 27KB/s 重下一遍，外加收藏和标题全丢。
+        guard isTrustworthy else { throw SaveError.refusedUntrustworthy }
         let enc = JSONEncoder()
         // sortedKeys 让 diff 稳定；withoutEscapingSlashes 对齐 Python 的 ensure_ascii=False 观感
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try enc.encode(self).write(to: url, options: .atomic)
+        let data = try enc.encode(self)
+        // 写新的之前先留一份上一版。清单是这个 App 唯一不可再生的状态
+        // （音频丢了还能从设备重下，账本丢了就只能靠重下整台设备来重建）。
+        if let old = try? Data(contentsOf: url), !old.isEmpty {
+            try? old.write(to: url.appendingPathExtension("bak"), options: .atomic)
+        }
+        try data.write(to: url, options: .atomic)
     }
 }
 
@@ -158,8 +199,29 @@ public enum SyncPlanner {
     /// - Parameters:
     ///   - status: 3-20 录音状态，1=录音中 2=未录音 3=暂停；取不到是 nil
     ///   - current: 3-24 当前文件名，取不到是 nil
+    ///
+    /// **两个 nil 的方向必须都朝安全那边倒。** 2026-09-07 code review 抓到：
+    /// 原来第一行是 `guard let current else { return false }`——读不到「当前在录哪个」
+    /// 就判定「没有正在录的」。而 `readDeviceInfo` 用 `try?` 吞掉读取失败，
+    /// 27KB/s 的链路上 4 秒超时很常见，旧固件甚至可能根本不答 3-24。
+    /// 于是**一次丢包就解除了这道闸**：正在长的文件被拉成半截，
+    /// 而字节数与设备当时声称的大小恰好一致，下载完整性硬闸也拦不住它
+    /// （它内部自洽，只是短）。接着以 `mac-ble-<base>` 推上去并 finalize，
+    /// 完整版此后因为 `manifest.uploaded` 已有键，连队列都进不了。
+    /// 这正是 2026-08-27「补传腰斩正在录的录音」那次事故的同一条路。
+    ///
+    /// 现在的判据：**设备说它在录（1/3），却说不出在录哪个 → 这一批全都不安全。**
+    ///
+    /// 只收窄到这一种组合，不扩大到「status 也读不到」。写宽的那版被自测挡下来了，
+    /// 挡得对：`status == nil` 分不清「这次读失败」和「这个固件根本不实现 3-20」，
+    /// 一律拦等于让老固件永远同步不了——**为了防一种丢失而制造另一种彻底不可用，
+    /// 是更坏的交易**。status 读不到那一路交给上层记日志（readDeviceInfo）。
     public static func isLive(_ e: FileEntry, status: UInt8?, current: String?) -> Bool {
-        guard let current, !current.isEmpty else { return false }
+        let recording = status == 1 || status == 3
+        guard let current, !current.isEmpty else {
+            // 设备自称在录、却说不出在录哪个：这一批里任何一条都可能是它，全拦。
+            return recording
+        }
         // 状态取不到（nil）时按最坏情况处理：只要设备报了「当前文件」就当它在录。
         if let status, status != 1 && status != 3 { return false }
         return normalizedBase(current) == normalizedBase(e.name)
@@ -208,20 +270,60 @@ public enum SyncPlanner {
     /// 抽成纯函数是因为它是**安全关键**的：判错一次，半截录音就会冒充完整的推进深脑，
     /// 而本地看起来一切正常（2026-08-29 的三小时会议就是这么丢的）。
     /// 内联在下载循环里没法单测，出了事只能靠人肉复盘。
-    public static func downloadComplete(got: Int, announced: UInt32) -> Bool {
-        got > 0 && got == Int(announced) && got % 40 == 0
+    /// - Parameter isRawOpus: 这次下回来的是不是裸 opus 包。
+    ///   `% 40` 这条只对裸包成立——40 字节 = 20ms 一包，除不尽就是截在半包上。
+    ///   设备也可能吐 wav（`FileEntry.candidates` 里 `.opus` 之后就是 `.wav`），
+    ///   而 wav 的长度是任意的：2026-09-07 code review 发现，把 `% 40` 无差别地
+    ///   套在 wav 上，**39/40 的概率会把一个完好的文件判成「不完整」**，
+    ///   重试五次之后进「放弃」名单——这多半就是那条 9 天试了 97 次的僵尸条目。
+    ///   对 wav 而言，「字节数与设备声称的一致」本身就是完整性判据。
+    public static func downloadComplete(got: Int, announced: UInt32, isRawOpus: Bool = true) -> Bool {
+        guard got > 0, got == Int(announced) else { return false }
+        return isRawOpus ? got % 40 == 0 : true
     }
 
     /// 本地已经有完整副本、但清单没记账的条目。补记用，不重下。
+    ///
+    /// **必须同时确认 ogg 真的在**。2026-09-07 code review 抓到：原来只看裸包，
+    /// 然后记一条 `file: "<base>.ogg"` 的账——而落盘那段是先写裸包、再封 ogg，
+    /// 封装或写 ogg 失败时直接 `continue`，裸包留在原地、清单没记。
+    /// 下一轮这里看到裸包完整就补账，**断言了一个从来没写成功的 ogg**。
+    /// 此后 `pending` 因为「已记账」跳过它、`scanUploadable` 因为「没有 ogg」找不到它——
+    /// 音频以裸包形式活着，但自动路径里再没有任何东西会去碰它。
+    /// 这种「裸包在、ogg 不在」的该走 `needsRewrap`，本地封一次就行，不用重下。
     public static func unrecorded(entries: [FileEntry], manifest: SyncManifest,
                                   status: UInt8?, current: String?,
-                                  localRaw: [String: Int]) -> [FileEntry] {
+                                  localRaw: [String: Int],
+                                  localOgg: Set<String>) -> [FileEntry] {
         entries.filter { e in
-            guard manifest.imported[manifestKey(e)] == nil else { return false }
-            guard !isLive(e, status: status, current: current) else { return false }
-            guard let have = localRaw[normalizedBase(e.name)] else { return false }
-            return have == Int(e.size) && have % 40 == 0 && have > 0
+            guard hasCompleteRaw(e, manifest: manifest, status: status,
+                                 current: current, localRaw: localRaw) else { return false }
+            return localOgg.contains(normalizedBase(e.name))
         }
+    }
+
+    /// 裸包完整、但 ogg 不在：本地重封一次即可，**不必重下**。
+    ///
+    /// 裸包是设备原样吐出来的字节，封装是纯本地的确定性变换——
+    /// 27KB/s 的链路上，为一个已经躺在磁盘上的文件重下一遍是纯粹的浪费。
+    public static func needsRewrap(entries: [FileEntry], manifest: SyncManifest,
+                                   status: UInt8?, current: String?,
+                                   localRaw: [String: Int],
+                                   localOgg: Set<String>) -> [FileEntry] {
+        entries.filter { e in
+            guard hasCompleteRaw(e, manifest: manifest, status: status,
+                                 current: current, localRaw: localRaw) else { return false }
+            return !localOgg.contains(normalizedBase(e.name))
+        }
+    }
+
+    private static func hasCompleteRaw(_ e: FileEntry, manifest: SyncManifest,
+                                       status: UInt8?, current: String?,
+                                       localRaw: [String: Int]) -> Bool {
+        guard manifest.imported[manifestKey(e)] == nil else { return false }
+        guard !isLive(e, status: status, current: current) else { return false }
+        guard let have = localRaw[normalizedBase(e.name)] else { return false }
+        return have == Int(e.size) && have % 40 == 0 && have > 0
     }
 
     /// 设备列表 + 本地磁盘 + 清单 → 界面用的状态链。
@@ -400,6 +502,8 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     private var brain: DeepBrain?
     private var monitorTask: Task<Void, Never>?
     private var isSyncing = false
+    /// 刷上传队列的互斥标志。见 flushUploadQueue 顶部的注释。
+    private var isFlushing = false
     /// 设备 id → 上次触发同步的时刻（冷却用）
     private var lastTriggered: [String: Date] = [:]
     /// base → 最近一次错误，喂给 items.lastError
@@ -639,20 +743,49 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         var manifest = SyncManifest.load(from: paths.manifest)
         let rawOnDisk = scanLocal(paths.rawPackets, ext: "opus")
 
-        // 先补账：本地已经有完整副本却没记上的，登记一下就行，别再下一遍。
+        let oggOnDisk = Set(scanLocal(paths.dest, ext: "ogg").keys)
+
+        // 先补账：裸包和 ogg 都在、只是清单没记上的，登记一下就行，别再下一遍。
         let recovered = SyncPlanner.unrecorded(entries: entries, manifest: manifest,
                                                status: lastStatus, current: lastCurrent,
-                                               localRaw: rawOnDisk)
+                                               localRaw: rawOnDisk, localOgg: oggOnDisk)
         if !recovered.isEmpty {
             for e in recovered {
                 let b = SyncPlanner.normalizedBase(e.name)
                 manifest.imported[SyncPlanner.manifestKey(e)] = SyncManifest.Imported(
                     file: "\(b).ogg", bytes: rawOnDisk[b] ?? 0, at: Self.stamp(Date()))
             }
-            try? manifest.save(to: paths.manifest)
+            persist(manifest)
             log.write("补记 \(recovered.count) 条：本地已有完整副本但清单没记账，"
                       + recovered.map { SyncPlanner.normalizedBase($0.name) }.joined(separator: "、"))
         }
+
+        // 裸包完整但 ogg 不在：本地重封，不重下。
+        // 这些是上一轮「裸包写成了、封装那步炸了」留下的——以前它们会被上面那段
+        // 直接补账成「已导入」，从此再没有任何自动路径会碰它们（见 unrecorded 的注释）。
+        let rewrap = SyncPlanner.needsRewrap(entries: entries, manifest: manifest,
+                                             status: lastStatus, current: lastCurrent,
+                                             localRaw: rawOnDisk, localOgg: oggOnDisk)
+        for e in rewrap {
+            let b = SyncPlanner.normalizedBase(e.name)
+            let rawURL = paths.rawPackets.appendingPathComponent("\(b).opus")
+            guard let raw = try? Data(contentsOf: rawURL) else {
+                log.write("重封 \(b) 失败：裸包读不出来（\(rawURL.lastPathComponent)）")
+                continue
+            }
+            do {
+                let ogg = try OggWrap.wrap([UInt8](raw))
+                try Data(ogg).write(to: paths.dest.appendingPathComponent("\(b).ogg"), options: .atomic)
+                manifest = SyncManifest.load(from: paths.manifest)
+                manifest.imported[SyncPlanner.manifestKey(e)] = SyncManifest.Imported(
+                    file: "\(b).ogg", bytes: raw.count, at: Self.stamp(Date()))
+                persist(manifest)
+                log.write("重封 \(b)：裸包完整但 ogg 缺失，本地补封成功（没有重下）")
+            } catch {
+                log.write("重封 \(b) 失败：\(describe(error))——裸包留着，下一轮再试")
+            }
+        }
+        if !rewrap.isEmpty { refreshLocalView() }
 
         let todo = SyncPlanner.pending(entries: entries, manifest: manifest,
                                        status: lastStatus, current: lastCurrent,
@@ -706,10 +839,16 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             // 而本地看起来一切正常。一条三小时的会议就这么没进深脑。
             //
             // 所以这里加一道硬闸：**收到的字节必须与设备报的大小一字不差**，
-            // 且能被 40 整除（40 B = 20 ms 一包，除不尽就是截断在半包上）。
+            // 裸包还要能被 40 整除（40 B = 20 ms 一包，除不尽就是截断在半包上）。
             // 对不上就当失败重下，绝不落盘——宁可重来，也不能让半截录音冒充完整的。
+            //
+            // 「是不是裸包」按**成功的那个候选名**判，不按内容猜：设备吐 wav 时
+            // 长度是任意的，拿 `% 40` 去卡它会把完好的文件误判成不完整（见
+            // downloadComplete 的注释）。
+            let gotRawOpus = !res.filename.lowercased().hasSuffix(".wav")
             let want = Int(e.size)
-            if !SyncPlanner.downloadComplete(got: res.data.count, announced: e.size) {
+            if !SyncPlanner.downloadComplete(got: res.data.count, announced: e.size,
+                                             isRawOpus: gotRawOpus) {
                 let pct = want > 0 ? Double(res.data.count) / Double(want) * 100 : 0
                 errors[base] = String(format: "只收到 %d/%d 字节（%.1f%%），设备却报了完成——按未完成处理",
                                       res.data.count, want, pct)
@@ -750,7 +889,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             // 成功了就把失败账清零——判据是「**连续**失败」，
             // 不清的话一条平时偶尔抖一下的文件，攒够五次就再也不自动下了。
             manifest.downloadFailures[SyncPlanner.manifestKey(e)] = nil
-            try? manifest.save(to: paths.manifest)
+            persist(manifest)
             imported += 1
             log.write("导入 \(outName) \(res.data.count)B \(String(format: "%.1f", res.kbps))KB/s"
                       + (res.resumes > 0 ? " 续传\(res.resumes)次" : ""))
@@ -862,6 +1001,13 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         }
         lastStatus = device.recordStatus
         lastCurrent = (try? await client.currentFilename()) ?? nil
+        // 这两个值是「不许碰正在录的那条」那道闸的全部输入（SyncPlanner.isLive）。
+        // 读不到不是小事，必须留痕——以前它们和电量固件一样被 try? 一起吞掉，
+        // 而闸失效时日志里一个字都没有。
+        if lastStatus == nil || lastCurrent == nil {
+            log.write("设备状态读不全（录音状态 \(lastStatus.map(String.init) ?? "读不到")"
+                      + "、当前文件 \(lastCurrent ?? "读不到")）——这一轮按最坏情况处理，可能整批跳过")
+        }
     }
 
     // MARK: - 待推队列
@@ -889,6 +1035,16 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     /// 上传是可以无限重试的另一件事（幂等键保证重试不会建重复会话）。
     @discardableResult
     private func flushUploadQueue(force: Bool = false) async -> Int {
+        // **同一时刻只准有一条刷队列在跑。**
+        // 调用点现在有四个：runSync 结尾、syncNow 找不到设备时的兜底、
+        // retryUploads（界面按钮，无守卫）、10 分钟补推循环。
+        // @MainActor 挡得住数据竞争，挡不住这个——每个 await 都是让出点，
+        // 让出期间另一条路径可以整个走完，包括 rebuildUploadQueue 换掉队列本身。
+        // 后果不只是重复上传（幂等键大多能兜住），还有按下标写回时的越界崩溃。
+        guard !isFlushing else { return 0 }
+        isFlushing = true
+        defer { isFlushing = false }
+
         var manifest = SyncManifest.load(from: paths.manifest)
         rebuildUploadQueue(manifest, local: scanUploadable(paths.dest))
         guard !uploadQueue.isEmpty else { refreshLocalView(); return 0 }
@@ -912,9 +1068,27 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         for (idx, job) in uploadQueue.enumerated() {
             guard force || job.nextAttempt <= now else { continue }
             let base = job.base
+            // **同一轮里，被上一条合并进去的段不能再单独推一遍。**
+            //
+            // 2026-09-07 code review：合并 A+B 之后代码正确地记了 uploaded[B]，
+            // 但循环**继续走到 B 自己那次迭代**，而迭代里没有任何地方复查
+            // uploaded[base]。于是 B 以从没用过的幂等键 mac-ble-B 又建一个新会话：
+            // 同一场会在深脑里出现两次（一次完整合并、一次只有后半段），
+            // 双倍转写与分析开销，而且 uploaded[B] 被改写成指向那个单独的会话，
+            // 合并出来的那条从此没人引用得到。
+            // 原注释只推演了「下一轮」，漏了「同一轮」。
+            manifest = SyncManifest.load(from: paths.manifest)
+            guard manifest.uploaded[base] == nil else { continue }
             let ext = uploadExt[base] ?? "ogg"
             let url = paths.dest.appendingPathComponent("\(base).\(ext)")
-            guard var data = try? Data(contentsOf: url) else { continue }
+            guard var data = try? Data(contentsOf: url) else {
+                // 一秒钟前 scanUploadable 还列出了它，现在读不出来——
+                // iCloud 把它驱逐上云了，或者权限/损坏。这条会永远停在「排队中」
+                // 而没有任何痕迹，所以必须说话（原来这里是裸 continue）。
+                log.write("读不出 \(base).\(ext)，本轮跳过（多半是 iCloud 把它驱逐上云了，先下载回本地）")
+                errors[base] = "本地文件读不出来——可能被 iCloud「优化存储」挪上云了，在访达里下载回来再推"
+                continue
+            }
 
             // 录音笔有 3 小时上限，到点自动断开、隔 1 秒开下一条。
             // 一场三个半小时的会因此变成两条，在深脑里成了两场互不相干的会——
@@ -925,7 +1099,11 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             // 首尾相接即合法，零损耗、不重编码。
             var mergedBases: [String] = [base]
             if ext == "ogg" {
-                let ordered = rawSizes.keys.sorted()
+                // **已经推上去的段不能再被合并进来。**
+                // 扫的是磁盘上所有裸包，不带任何「推过没有」的过滤——于是几周前
+                // 单独推过的一段，可能被今天这次合并重新卷进去：深脑里多一份重复音频，
+                // 而它原来那个会话再也没人引用得到（uploaded 指向被改写）。
+                let ordered = rawSizes.keys.sorted().filter { manifest.uploaded[$0] == nil || $0 == base }
                 var cursor = base
                 while let nextBase = ordered.first(where: { $0 > cursor
                         && Continuation.isContinuation(
@@ -1012,19 +1190,26 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
                     errors[b] = nil
                     brainState[b] = ("processing", nil, nil)
                 }
-                try? manifest.save(to: paths.manifest)
+                persist(manifest)
                 log.write("推深脑 \(mergedBases.joined(separator: "+")) 会话 \(up.sessionId)"
                           + (up.alreadyDone ? "（幂等重放，未重传）" : ""))
                 ok += 1
             } catch {
-                var job = uploadQueue[idx]
+                // **按 base 找，不按下标写回。** 下标是循环开始时那份快照的位置，
+                // 而 `await brain.upload` 中间任何一次让出，都可能有另一条路径
+                // 调 rebuildUploadQueue 把 uploadQueue 整个换成一个更短的数组——
+                // 那时 `uploadQueue[idx]` 就是越界，@MainActor 上直接崩掉整个 App。
+                // 2026-09-07 code review 抓到：加了 10 分钟补推循环之后，
+                // 「补推正在跑」和「蓝牙同步刚结束也要刷一次」这两条真的会撞上。
+                guard let live = uploadQueue.firstIndex(where: { $0.base == base }) else { continue }
+                var job = uploadQueue[live]
                 job.attempts += 1
                 job.lastError = describe(error)
                 // 指数退避，封顶 30 分钟。深脑那头可能是网络抖动，也可能是登录过期，
                 // 后者重试再快也没用，别把日志刷爆。
                 let delay = min(1800, 30 * pow(2, Double(job.attempts - 1)))
                 job.nextAttempt = Date().addingTimeInterval(delay)
-                uploadQueue[idx] = job
+                uploadQueue[live] = job
                 errors[base] = "推深脑失败（第 \(job.attempts) 次）：\(job.lastError ?? "")"
                 log.write("推深脑失败 \(base) 第\(job.attempts)次：\(job.lastError ?? "")"
                           + "，\(Int(delay))s 后重试")
@@ -1211,6 +1396,20 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         return b
     }
 
+    /// 保存清单，失败必须留痕。
+    ///
+    /// 13 个写入点原本全是 `try? manifest.save(...)`——而 save 现在会在
+    /// 「这份清单来自一次失败的读取」时主动抛错拒绝写入（见 SyncManifest.save）。
+    /// 用 `try?` 接住等于把那次拒绝也一起吞掉：账本没记上，日志里一个字都没有，
+    /// 正是这个仓库反复强调不许出现的那种静默失败。
+    private func persist(_ m: SyncManifest) {
+        do {
+            try m.save(to: paths.manifest)
+        } catch {
+            log.write("清单没保存成功：\(describe(error))——这一轮的记账没写下去，下一轮会重来")
+        }
+    }
+
     /// 记一次下载失败。攒够 `SyncPlanner.giveUpAfter` 次就不再自动重试这一条。
     ///
     /// 每次都立刻写回磁盘，不攒到本轮结束——这份账要跨重启活着才有意义
@@ -1220,7 +1419,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         let key = SyncPlanner.manifestKey(e)
         let n = (m.downloadFailures[key] ?? 0) + 1
         m.downloadFailures[key] = n
-        try? m.save(to: paths.manifest)
+        persist(m)
         if n == SyncPlanner.giveUpAfter {
             let base = SyncPlanner.normalizedBase(e.name)
             log.write("\(base) 连续 \(n) 次下载失败，不再自动重试（界面上仍可手动重试）")
@@ -1234,7 +1433,7 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         for key in m.downloadFailures.keys where key.contains(base) {
             m.downloadFailures[key] = nil
         }
-        try? m.save(to: paths.manifest)
+        persist(m)
         errors[base] = nil
         log.write("人手重置 \(base) 的下载失败计数，下一轮会重新尝试")
         refreshLocalView()
@@ -1488,7 +1687,7 @@ public extension SyncEngine {
                 // 重读是为了不覆盖别处刚写的 imported/uploaded。
                 var fresh = SyncManifest.load(from: paths.manifest)
                 fresh.deleted[d.name] = Self.stamp(Date())
-                try? fresh.save(to: paths.manifest)
+                persist(fresh)
             } else {
                 failed += 1
             }
@@ -1621,7 +1820,7 @@ public extension SyncEngine {
                 let up = try await brain.upload(audio: [UInt8](data), title: base, durationSec: dur,
                                                 clientRequestId: "mac-ble-\(base)-r\(round)")
                 manifest.uploaded[base] = up.sessionId
-                try? manifest.save(to: paths.manifest)
+                persist(manifest)
                 brainState[base] = ("processing", nil, nil)
                 log.write("重推 \(base) 第 \(round) 轮 → 新会话 \(up.sessionId)")
                 await refreshBrainStatus(manifest)
@@ -1658,7 +1857,7 @@ public extension SyncEngine {
             return
         }
         for k in keys { manifest.imported.removeValue(forKey: k) }
-        try? manifest.save(to: paths.manifest)
+        persist(manifest)
         log.write("已把 \(base) 标记为待重下，设备下次出现时会重新拉取")
         lastSummary = "\(base) 已标记为待重下"
         refreshLocalView()
@@ -1724,7 +1923,7 @@ public extension SyncEngine {
                 pendingDeviceDelete.remove(base)
                 var m = SyncManifest.load(from: paths.manifest)
                 m.deleted[base] = Self.stamp(Date())
-                try? m.save(to: paths.manifest)
+                persist(m)
                 log.write("已按你的要求从设备删除 \(base)：\(r.1)")
             } else {
                 log.write("从设备删除 \(base) 失败：\(r.1)")
@@ -1755,7 +1954,7 @@ public extension SyncEngine {
                                                 clientRequestId: "mac-ble-\(base)")
                 var m = SyncManifest.load(from: paths.manifest)
                 m.uploaded[base] = up.sessionId
-                try? m.save(to: paths.manifest)
+                persist(m)
                 brainState[base] = ("processing", nil, nil)
                 skippedShort[base] = nil
                 log.write("手动推送 \(base) → 会话 \(up.sessionId)")
@@ -1779,7 +1978,7 @@ public extension SyncEngine {
         let t = title?.trimmingCharacters(in: .whitespaces).nilIfEmpty
         if t == nil && projectId == nil { m.plan.removeValue(forKey: base) }
         else { m.plan[base] = SyncManifest.Plan(title: t, projectId: projectId) }
-        try? m.save(to: paths.manifest)
+        persist(m)
         refreshLocalView()
     }
 
@@ -1787,7 +1986,7 @@ public extension SyncEngine {
         var m = SyncManifest.load(from: paths.manifest)
         if let i = m.starred.firstIndex(of: base) { m.starred.remove(at: i) }
         else { m.starred.append(base) }
-        try? m.save(to: paths.manifest)
+        persist(m)
         refreshLocalView()
     }
 }

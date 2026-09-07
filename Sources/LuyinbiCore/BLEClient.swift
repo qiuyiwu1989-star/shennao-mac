@@ -119,7 +119,14 @@ public final class BLEClient: NSObject, @unchecked Sendable {
     /// 最后一个走人时自动 stopScan。
     public func advertisements() -> AsyncStream<Discovered> {
         let id = UUID()
-        return AsyncStream<Discovered> { cont in
+        // **只留最新一条。** 默认是 .unbounded，而扫描是 withServices: nil +
+        // AllowDuplicates: true——附近每一台 BLE 设备的每一次广播都会进来。
+        // 消费者（monitorLoop）在 `await runSync(...)` 里一待就是整场下载，
+        // 一次 13 分钟的 21MB 传输期间，缓冲里会堆起十万量级的 Discovered，
+        // 每个还retain 着一个 CBPeripheral（2026-09-07 review）。
+        // 下游不需要历史：谁最近在广播才是有用的信息，而重复触发由
+        // passedCooldown 挡着。
+        return AsyncStream<Discovered>(bufferingPolicy: .bufferingNewest(1)) { cont in
             // 先挂终止回调再登记，顺序反了理论上没差（build 闭包同步执行，
             // 这中间不可能收到终止），但这样读起来更像「注册-注销」成对出现。
             cont.onTermination = { [weak self] _ in self?.removeSink(id) }
@@ -218,7 +225,17 @@ public final class BLEClient: NSObject, @unchecked Sendable {
 
     /// 整帧一次写入。绝不在应用层分包——2-2 / 2-8 拆包设备会解析错文件名。
     public func sendRaw(_ frame: [UInt8]) throws {
-        guard let p = peripheral, let c = writeChar else { throw BLEError.notConnected }
+        // **取快照要加锁。** 这两个字段别处一律在锁内读写（prepareForConnect /
+        // handleDisconnect 都在蓝牙队列上把 peripheral 置 nil 并释放），
+        // 只有这里是裸读——而 @unchecked Sendable 把编译器的警告也关掉了。
+        // 触发场景就是最常见的那个：设备被人拿走、下载中途断连，
+        // 此时下载任务正好在这一行（2026-09-07 review）。
+        // 写值本身放到锁外：writeValue 会同步进 CoreBluetooth，不该占着锁。
+        lock.lock()
+        let p = peripheral
+        let c = writeChar
+        lock.unlock()
+        guard let p, let c else { throw BLEError.notConnected }
         p.writeValue(Data(frame), for: c, type: .withoutResponse)
     }
 
@@ -488,9 +505,21 @@ extension BLEClient: CBPeripheralDelegate {
     }
 
     public func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor c: CBCharacteristic, error: Error?) {
-        lock.lock(); notifyReady += 1; let ready = notifyReady; lock.unlock()
-        // AE22 订阅上就能开工；AE23 缺失不致命
-        if ready >= 1 { finishDiscover(.success(())) }
+        // **必须认准是哪一路、而且真的订阅成功了。**
+        // 原来不看 c.uuid 也不看 error，来一个回调就宣布连接就绪：
+        //   · AE23（按键事件）先订上 → 连接报成功，而文件数据走的 AE22 可能还没通
+        //   · AE22 订阅带着 error 回来 → 照样报成功，这条链路根本收不到数据
+        // 结果是用户等 30 秒文件列表超时、下载卡住，而真正的原因（订阅没成）
+        // 一个字都看不见（2026-09-07 review）。
+        let isDataChannel = c.uuid.uuidString.lowercased().hasPrefix("ae22")
+        guard isDataChannel else { return }          // AE23 缺失不致命，也不代表就绪
+        if let error {
+            finishDiscover(.failure(BLEError.missingCharacteristic(
+                "AE22 订阅失败：\(error.localizedDescription)")))
+            return
+        }
+        lock.lock(); notifyReady += 1; lock.unlock()
+        finishDiscover(.success(()))
     }
 
     public func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {

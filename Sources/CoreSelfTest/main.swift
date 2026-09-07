@@ -324,6 +324,17 @@ do {
     let after = try? Data(contentsOf: url)
     check("磁盘上的内容没有被空清单抹掉", (after?.count ?? 0) > 0, true)
 
+    // 跨重启必须活着的两本账：下载失败计数、重推轮次。
+    // 后者原来只在内存里——重启后 repushFailed 又从 r2 开始，而 r2 那个会话
+    // 如果已经是 failed，服务端会挡住重传，这条录音就再也推不上去了。
+    var counted = seeded
+    counted.downloadFailures["k"] = 3
+    counted.repushRounds["a"] = 4
+    check("失败计数与重推轮次能写进去", (try? counted.save(to: url)) != nil, true)
+    let reread = SyncManifest.load(from: url)
+    check("下载失败计数跨读写还在", reread.downloadFailures["k"] ?? 0, 3)
+    check("重推轮次跨读写还在", reread.repushRounds["a"] ?? 0, 4)
+
     // 修好之后照常读写
     check("重新写入好的清单可以恢复", (try? seeded.save(to: url)) != nil, true)
     let recovered = SyncManifest.load(from: url)

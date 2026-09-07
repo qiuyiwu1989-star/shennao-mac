@@ -15,13 +15,11 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>用这台 Mac 的麦克风直接录音。录下来的文件先存在本机，你决定推给深脑之后才会上传。</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>连接你的蓝牙录音笔，读取并导入设备里的录音文件。全程只读，不会删除设备上的内容。</string>
 	<key>NSHighResolutionCapable</key>

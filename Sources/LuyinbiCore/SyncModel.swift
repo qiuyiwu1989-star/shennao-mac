@@ -103,18 +103,6 @@ public enum SyncPhase: Equatable, Sendable {
     }
 }
 
-/// 同步引擎对界面暴露的全部内容。引擎实现放 Monitor.swift，界面只读这些。
-@MainActor
-public protocol SyncEngineObserving: AnyObject {
-    var device: DeviceInfo { get }
-    var items: [RecordingItem] { get }
-    var phase: SyncPhase { get }
-    var pendingBindMismatch: BindMismatch? { get }
-    var uploadBlocked: String? { get }
-    var lastRun: Date? { get }
-    var lastSummary: String { get }
-}
-
 extension String {
     /// 空串当没有。上传前定的标题被清空时，应该退回文件名而不是推一个空标题上去。
     var nilIfEmpty: String? { isEmpty ? nil : self }

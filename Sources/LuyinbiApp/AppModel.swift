@@ -45,11 +45,15 @@ struct AppActions {
 
 /// 界面侧的唯一数据源。
 ///
-/// 为什么不直接让界面观察引擎：`SyncEngineObserving` 只是个 `@MainActor` 的只读协议，
-/// 没有 Combine 发布能力，而引擎实现（Monitor.swift）由另一条线在写，
-/// 不能假设它是 ObservableObject。所以这里做一层「抄写」：
-/// 定时把引擎的快照抄进 @Published，界面只认这一份。
-/// 这样无论引擎用什么方式更新自己，界面都不用改。
+/// 引擎的状态抄一份到这里，界面只认这一份。
+///
+/// **抄的时机是订阅，不是轮询。** 原来是 0.4 秒一个 Timer + 一个把所有条目
+/// 拼成字符串的「指纹」来判断变没变。那个指纹漏掉了 18 个字段里的 9 个，
+/// 而漏掉的恰好是**用户自己动作会改的那些**：收藏、待删除、待认人数、
+/// 深脑标题、太短跳过……于是点了收藏没反应、点了从设备删除那一行不变、
+/// 认完人「认人 N」还挂着。当初写这层的理由（"引擎由另一条线在写，
+/// 不能假设它是 ObservableObject"）早就不成立了：`SyncEngine` 就是
+/// ObservableObject，七个被抄的属性全带 @Published（2026-09-07 review）。
 @MainActor
 final class AppModel: ObservableObject {
 
@@ -86,13 +90,11 @@ final class AppModel: ObservableObject {
 
     /// 深脑站点。接真引擎时应由引擎的配置覆盖这一行。
     var brainBaseURL = URL(string: "https://shennao.zaowuyun.com")!
-    /// 清理开关的界面镜像。真值在引擎里，这里只用于显示。
-    /// 哪个大面板开着。nil = 正常工作台。
+    /// 哪个大面板开着。nil = 正常详情。
     @Published var panel: Panel?
     enum Panel { case audit }
     /// 归档体检结果，菜单和面板共用
     @Published var auditReport: ArchiveAudit.Report?
-    /// 已登录的深脑客户端，说话人指认要用。接引擎时填上。
     /// 已登录的深脑客户端。登录/退出要用。
     @Published var brain: DeepBrain?
     @Published var cleanupEnabled = false
@@ -108,12 +110,7 @@ final class AppModel: ObservableObject {
     @Published var sessionNotice: String?
     @Published var launchAtLogin = false
 
-    /// 窗口出来之后再查，慢一点没关系，卡住才是灾难。
-    /// 把深脑生成的标题回填到列表项。
-    /// 引擎的 items 每次刷新会重建，所以这里只改内存里的副本——
-    /// 下次刷新会被覆盖，但那时工作台会再取一次，不会丢。
-    /// 搜索命中之后：选中那条 + 播到那一秒。
-    /// base → transcriptId。传给索引重建能省一轮网络（它本来要自己去查一遍会话）。
+    /// base → transcriptId。
     var transcriptIdMap: [String: String] {
         Dictionary(uniqueKeysWithValues: items.compactMap { i in
             i.transcriptId.map { (i.base, $0) }
@@ -163,42 +160,30 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private var engine: (any SyncEngineObserving)?
-    private var pollTimer: Timer?
-    private var lastSignature = ""
+    private var engine: SyncEngine?
+    private var cancellable: AnyCancellable?
 
-    init(engine: (any SyncEngineObserving)? = nil) {
+    init(engine: SyncEngine? = nil) {
         installDefaultActions()
         attach(engine)
     }
 
-    deinit { pollTimer?.invalidate() }
 
     // MARK: - 接引擎
 
     /// 换数据源就调这一个方法。
-    func attach(_ newEngine: (any SyncEngineObserving)?) {
+    func attach(_ newEngine: SyncEngine?) {
         engine = newEngine
-        pull(force: true)
-        startPolling()
+        pull()
+        // objectWillChange 是**变更之前**发的，所以要挪到下一轮 runloop 再读，
+        // 否则抄到的是旧值。`.common` 模式：拖窗口、开菜单时也不能停。
+        cancellable = newEngine?.objectWillChange
+            .receive(on: RunLoop.main, options: nil)
+            .sink { [weak self] _ in self?.pull() }
     }
 
-    private func startPolling() {
-        pollTimer?.invalidate()
-        guard engine != nil else { return }
-        // 0.4s 一次，只在快照真变了的时候才写 @Published，避免无谓重绘。
-        let t = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pull(force: false) }
-        }
-        RunLoop.main.add(t, forMode: .common)   // 拖窗口/开菜单时也别停
-        pollTimer = t
-    }
-
-    private func pull(force: Bool) {
+    private func pull() {
         guard let engine else { return }
-        let sig = Self.signature(of: engine)
-        guard force || sig != lastSignature else { return }
-        lastSignature = sig
         device = engine.device
         items = engine.items
         phase = engine.phase
@@ -210,19 +195,6 @@ final class AppModel: ObservableObject {
         if let s = selection, !items.contains(where: { $0.id == s }) { selection = nil }
     }
 
-    /// 变更指纹：够用就行，不求完备，只用来省重绘。
-    private static func signature(of e: some SyncEngineObserving) -> String {
-        let d = e.device
-        var s = "\(d.name)|\(d.connected)|\(d.battery ?? 255)|\(d.firmware ?? "")|\(d.gain ?? 255)"
-        s += "|\(d.recordStatus ?? 255)|\(d.capacityRemain ?? 0)|\(d.capacityTotal ?? 0)"
-        s += "|\(e.phase.label)|\(e.lastRun?.timeIntervalSince1970 ?? 0)|\(e.lastSummary)"
-        s += "|\(e.pendingBindMismatch?.id ?? "")|\(e.uploadBlocked ?? "")"
-        for i in e.items {
-            s += "#\(i.base),\(i.durationSec),\(i.deviceSize ?? 0),\(i.localBytes ?? 0)"
-            s += ",\(i.sessionId ?? ""),\(i.brainStatus ?? ""),\(i.transcriptId ?? ""),\(i.lastError ?? "")"
-        }
-        return s
-    }
 
     // MARK: - 派生状态
 

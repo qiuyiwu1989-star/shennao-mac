@@ -78,6 +78,14 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     /// 也不隐藏，界面上仍看得到并且能手动重试（设备换个姿势、固件重启都可能就好了）。
     public var downloadFailures: [String: Int] = [:]
 
+    /// 重推轮次（按 base 记）。
+    ///
+    /// **必须跨重启活着。** 2026-09-07 review：原来只在内存里，重启之后
+    /// `repushFailed` 又从 r2 开始。而 r2 那个会话如果已经是 failed，
+    /// `DeepBrain.upload` 会抛「failed 状态挡着重传」——于是这条录音
+    /// **在这台机器上再也重推不了了**，因为每次都在撞同一个键。
+    public var repushRounds: [String: Int] = [:]
+
     public struct Plan: Codable, Equatable, Sendable {
         public var title: String?
         public var projectId: String?
@@ -89,7 +97,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case imported, uploaded, deleted, starred, plan, downloadFailures
+        case imported, uploaded, deleted, starred, plan, downloadFailures, repushRounds
     }
 
     /// 逐键容错解码：某一个键的结构变了（比如 Cleanup 换了 deleted 的写法），
@@ -104,6 +112,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
         starred = (try? c.decode([String].self, forKey: .starred)) ?? []
         plan = (try? c.decode([String: Plan].self, forKey: .plan)) ?? [:]
         downloadFailures = (try? c.decode([String: Int].self, forKey: .downloadFailures)) ?? [:]
+        repushRounds = (try? c.decode([String: Int].self, forKey: .repushRounds)) ?? [:]
     }
 
     /// 这份清单是不是「读出来的」而不是「凭空造的」。
@@ -447,7 +456,7 @@ public struct PendingUpload: Identifiable, Sendable {
 // MARK: - 引擎
 
 @MainActor
-public final class SyncEngine: ObservableObject, SyncEngineObserving {
+public final class SyncEngine: ObservableObject {
 
     // MARK: 对界面暴露
     @Published public private(set) var device = DeviceInfo()
@@ -458,7 +467,8 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     /// 监听循环是否在跑（跟 phase 分开：同步过程中 phase 不是 waitingForDevice，但监听仍然开着）
     @Published public private(set) var monitoring = false
     /// 已落盘、欠深脑的队列。上传失败不影响音频，只是排进这里等重试。
-    @Published public private(set) var uploadQueue: [PendingUpload] = []
+    /// 已落盘、欠深脑的队列。界面不直接读它（读的是 items 的投影），所以不必 @Published。
+    private(set) var uploadQueue: [PendingUpload] = []
     /// 设备-账号绑定不一致，等着人确认（spec 019）。非 nil 时这支笔的同步全部拦下——
     /// 见 runSync 里的绑定检查。界面（DevicePage）据此显示确认卡片。
     @Published public private(set) var pendingBindMismatch: BindMismatch?
@@ -484,11 +494,11 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     }
 
     private lazy var log = SyncLog(url: paths.syncLog)
-    fileprivate var retryRounds: [String: Int] = [:]
     /// transcriptId -> 还没指认的说话人个数
     /// 因为太短而没推的：base -> 实际时长秒。界面上要说清楚是「按规则跳过」不是「失败」。
     /// 语音活动检测结果。只用于提示，不参与是否推送的决策。
-    @Published public private(set) var voiceReports: [String: VoiceActivity.Report] = [:]
+    /// 语音活动检测结果。只喂日志，没有界面读它——所以不必 @Published。
+    private var voiceReports: [String: VoiceActivity.Report] = [:]
     private var skippedShort: [String: Double] = [:]
     /// 人手点了「从设备删除」但设备还没出现的，排队等着
     private var pendingDeviceDelete: Set<String> = []
@@ -502,6 +512,25 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
     private var brain: DeepBrain?
     private var monitorTask: Task<Void, Never>?
     private var isSyncing = false
+
+    /// 认领这一轮同步。**检查和置位必须是同一个动作。**
+    ///
+    /// 2026-09-07 code review：`syncNow` 原来在最外层同步地判 `!isSyncing`，
+    /// 而 `isSyncing = true` 要等到 `runSync` 里才置——中间隔着一次
+    /// `discover(seconds: 8)`。那 8 秒里 isSyncing 还是 false，于是监听循环
+    /// 看到广播照样会起自己那一轮 runSync。
+    /// 两轮同步共用同一个 BLEClient（一个 pending 队列、一个 seq），
+    /// 帧会交错，谁先跑完谁的 `defer { client.disconnect() }` 就把另一边掐断。
+    /// 截断守卫能兜住损坏的结果，但代价是白跑一次 BLE 会话，
+    /// 而且**给一个其实没问题的文件记了一次下载失败**——攒够 5 次就被放弃了。
+    ///
+    /// `requestRedownload` / `requestDeviceDelete` 都会调 syncNow，
+    /// 所以「点重新下载再点从设备删除」就足以触发。
+    private func claimSync() -> Bool {
+        guard !isSyncing else { return false }
+        isSyncing = true
+        return true
+    }
     /// 刷上传队列的互斥标志。见 flushUploadQueue 顶部的注释。
     private var isFlushing = false
     /// 设备 id → 上次触发同步的时刻（冷却用）
@@ -571,12 +600,13 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
 
     /// 手动立刻同步一次。忽略冷却，但不会和正在跑的同步并发。
     public func syncNow() {
-        guard !isSyncing else {
+        guard claimSync() else {
             lastSummary = "正在同步中，忽略这次手动触发"
             return
         }
         Task { [weak self] in
             guard let self else { return }
+            defer { self.isSyncing = false }
             // 手动触发给更长的扫描窗口：人按了按钮就是愿意多等几秒
             guard let target = await self.discover(seconds: 8) else {
                 // 蓝牙这条路走不通，至少把欠深脑的补推掉——两件事本来就该解耦。
@@ -628,7 +658,10 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             if isSyncing { continue }              // 正在同步就跳过，别断流
             if isFailed(phase) { phase = .waitingForDevice }
             guard let target = pick([found]), passedCooldown(target) else { continue }
+            // 认领与执行之间不能再有 await，否则又回到 review 抓的那个竞态。
+            guard claimSync() else { continue }
             await runSync(target: target)
+            isSyncing = false
         }
 
         monitorTask = nil
@@ -689,9 +722,10 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
 
     /// 连接 → 读设备信息 → 拉列表 → 只导没导过的 → 封 Ogg 落盘 → 推深脑 → 断开。
     /// 步骤顺序照 pull.py，**不含任何删除**。
+    /// **调用前必须已经 claimSync() 成功**，本函数不自己置位——
+    /// 置位与检查分开正是 review 抓到的那个竞态的成因。
     private func runSync(target: Discovered) async {
-        isSyncing = true
-        defer { isSyncing = false }
+        assert(isSyncing, "runSync 必须在 claimSync() 之后调用")
 
         do { try paths.ensureDirs() } catch {
             phase = .failed("建不了导入目录：\(describe(error))")
@@ -922,17 +956,12 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             refreshLocalView()
         }
 
-        // 推深脑放在蓝牙之后：下载和上传解耦，上传慢/失败都不该占着录音笔的连接。
-        // 但深脑要网络，断开蓝牙再推更稳，所以这里只把队列刷一遍，
-        // 队列本身是从磁盘推导的，包含这一轮刚落盘的和历史欠的。
-        let uploaded = await flushUploadQueue()
-
-        // 清理放在推深脑之后、断开蓝牙之前。本轮刚上传的不会被本轮删掉——
-        // 深脑那时还没转写完，闸 A 就挡住了；冷静期默认 3 天，本来也轮不到它。
-        // 人手排队的删除优先于自动清理执行——人的意愿不该排在规则后面。
+        // 先把要碰设备的事做完：人手排的删除 → 自动清理。
+        // 人的意愿排在规则前面。
         var cleanNote = ""
         let manualDeleted = await runPendingDeletes(client: client, entries: entries,
-                                                    recordStatus: device.recordStatus)
+                                                    recordStatus: device.recordStatus,
+                                                    listComplete: gotDone)
         if manualDeleted > 0 { cleanNote = "按你的要求删了 \(manualDeleted) 条" }
 
         if cleanup.deleteAfterSync {
@@ -947,6 +976,22 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
             }
             if r.deleted > 0 { refreshLocalView() }
         }
+
+        // **碰设备的事全做完了，立刻放掉蓝牙，再去推深脑。**
+        //
+        // 这一段的注释一直写着「断开蓝牙再推更稳」，而代码并没有这么做：
+        // disconnect() 挂在函数开头注册的 defer 上，真正执行是在整个 runSync
+        // 返回之后——也就是**推完深脑之后**。一次合并的三个半小时录音要传
+        // 20MB+，慢网下十几分钟，这期间录音笔一直被我们占着：
+        // 耗它的电、挡着手机 App 连它（BLE 从机同时只接受一个主机）、
+        // 也让它无法回到低功耗广播——而低功耗广播正是 idleBackoff 想省的东西。
+        //
+        // 显式断在这里；defer 里那次仍然留着，负责所有中途返回的错误路径
+        // （disconnect 幂等，重复调用是空操作）。
+        client.disconnect()
+        device.connected = false
+
+        let uploaded = await flushUploadQueue()
 
         lastRun = Date()
         var parts: [String] = []
@@ -1423,21 +1468,10 @@ public final class SyncEngine: ObservableObject, SyncEngineObserving {
         if n == SyncPlanner.giveUpAfter {
             let base = SyncPlanner.normalizedBase(e.name)
             log.write("\(base) 连续 \(n) 次下载失败，不再自动重试（界面上仍可手动重试）")
-            errors[base] = "试了 \(n) 次都没拿到内容，已停止自动重试——可以手动再试一次"
+            errors[base] = "试了 \(n) 次都没拿到内容，已停止自动重试——详情里点「重新下载」可以再试"
         }
     }
 
-    /// 界面调用：人手要求重试一条已经被放弃的下载。把失败账清零，下一轮就会再排上。
-    public func retryGivenUpDownload(_ base: String) {
-        var m = SyncManifest.load(from: paths.manifest)
-        for key in m.downloadFailures.keys where key.contains(base) {
-            m.downloadFailures[key] = nil
-        }
-        persist(m)
-        errors[base] = nil
-        log.write("人手重置 \(base) 的下载失败计数，下一轮会重新尝试")
-        refreshLocalView()
-    }
 
     // MARK: - 设备-账号绑定（spec 019）
 
@@ -1651,15 +1685,11 @@ public extension SyncEngine {
         return await execute(decisions, entries: entries, client: client)
     }
 
-    /// 显式擦除：只看本地留档完整性，不看深脑、不看冷静期。
-    /// **只能由人手动触发**，自动流程永远不会走到这里。
-    func performWipe(client: BLEClient, entries: [FileEntry],
-                     recordStatus: UInt8?, deviceCurrent: String?) async -> (deleted: Int, note: String) {
-        let decisions = Cleanup.planWipe(entries, dest: paths.dest, rawDir: paths.rawPackets,
-                                         recordStatus: recordStatus.map(Int.init),
-                                         deviceCurrent: deviceCurrent)
-        return await execute(decisions, entries: entries, client: client)
-    }
+    // 「显式擦除」（planWipe：只看本地留档、不看深脑也不看冷静期）**这里不实现**。
+    // 它原来有一份 performWipe，但零调用点、界面也故意没有入口——
+    // 一个谁都够不到、又能一次抹光设备的函数，留着只是等哪天有人接错线。
+    // 真要用走 Python 版的 `--wipe-verified`（原注释本来就是这么说的）。
+    // 判据留在 Cleanup.planWipe 里，有自测钉着，随时可以重新接。
 
     private func execute(_ decisions: [Cleanup.Decision], entries: [FileEntry],
                          client: BLEClient) async -> (Int, String) {
@@ -1812,13 +1842,21 @@ public extension SyncEngine {
             }
             let raw = paths.rawPackets.appendingPathComponent("\(base).opus")
             let dur = (try? Data(contentsOf: raw)).map { OggWrap.durationSeconds(rawLength: $0.count) } ?? 0
-            var manifest = SyncManifest.load(from: paths.manifest)
-            let round = (retryRounds[base] ?? 1) + 1
-            retryRounds[base] = round
+            var rounds = SyncManifest.load(from: paths.manifest)
+            let round = (rounds.repushRounds[base] ?? 1) + 1
+            rounds.repushRounds[base] = round
+            persist(rounds)
             phase = .uploading(base, "重推第 \(round) 轮")
             do {
                 let up = try await brain.upload(audio: [UInt8](data), title: base, durationSec: dur,
                                                 clientRequestId: "mac-ble-\(base)-r\(round)")
+                // **清单在 await 之后才读。**
+                // 原来快照取在上传之前，而上传一个 20MB 的文件要几分钟——
+                // 这期间别的路径写进清单的东西（刚下完的 imported、Cleanup 的 deleted、
+                // 下载失败计数、收藏与标题）在这一行全被回滚掉。
+                // 「await 之后重读」这条纪律这个文件里到处都在讲，只有这里破了例，
+                // 而它偏偏是界面上唯一的重推入口（2026-09-07 review）。
+                var manifest = SyncManifest.load(from: paths.manifest)
                 manifest.uploaded[base] = up.sessionId
                 persist(manifest)
                 brainState[base] = ("processing", nil, nil)
@@ -1849,16 +1887,31 @@ public extension SyncEngine {
     /// 不需要另写一条下载路径。设备此刻不在也没关系，等它出现自然会补上。
     ///
     /// 注意这会覆盖本地已有的 ogg 和裸包，正是这个按钮的本意（怀疑本地那份坏了）。
+    /// 人手要求重新下载一条。
+    ///
+    /// **两件事都要做：清「已导入」的账，也清「下载失败」的账。**
+    /// 2026-09-07 review：原来只清 imported，并且 `guard !keys.isEmpty` 直接返回——
+    /// 而一条**从没成功下载过**的录音根本没有 imported 键，于是这个按钮
+    /// 对它永远是空转（日志里只留一句「清单里没有它，跳过」）。
+    /// 更要命的是即使放行了也没用：`pending()` 还会因为失败计数到阈值把它滤掉。
+    /// 也就是说，最需要「重新下载」的那种条目，恰好是这个按钮唯一救不了的。
     func requestRedownload(_ base: String) {
         var manifest = SyncManifest.load(from: paths.manifest)
-        let keys = manifest.imported.keys.filter { $0.hasPrefix("\(base).|") || $0.hasPrefix("\(base)|") }
-        guard !keys.isEmpty else {
-            log.write("重下 \(base)：清单里没有它，跳过")
+        let importedKeys = manifest.imported.keys.filter { $0.hasPrefix("\(base).|") || $0.hasPrefix("\(base)|") }
+        let failureKeys = manifest.downloadFailures.keys.filter { $0.contains(base) }
+        guard !importedKeys.isEmpty || !failureKeys.isEmpty else {
+            // 空转也要留痕：一个点了没反应的按钮，不该连日志里都查不到。
+            log.write("重下 \(base)：清单里既没有导入记录也没有失败计数，无事可做")
+            lastSummary = "\(base) 本来就在待下载队列里"
+            syncNow()
             return
         }
-        for k in keys { manifest.imported.removeValue(forKey: k) }
+        for k in importedKeys { manifest.imported.removeValue(forKey: k) }
+        for k in failureKeys { manifest.downloadFailures.removeValue(forKey: k) }
         persist(manifest)
-        log.write("已把 \(base) 标记为待重下，设备下次出现时会重新拉取")
+        errors[base] = nil
+        log.write("已把 \(base) 标记为待重下（清了 \(importedKeys.count) 条导入记录、"
+                  + "\(failureKeys.count) 条失败计数），设备下次出现时会重新拉取")
         lastSummary = "\(base) 已标记为待重下"
         refreshLocalView()
         syncNow()
@@ -1904,20 +1957,37 @@ public extension SyncEngine {
     }
 
     /// 同步流程里执行排队的删除。返回删掉几条。
+    /// - Parameter listComplete: 这份 entries 是不是一份**可信的完整列表**
+    ///   （收到了 2-18 结束帧）。`fileList()` 分不清「设备里没有文件」和
+    ///   「设备压根没答话」——两种都返回空数组。而下面「列表里没有它 =
+    ///   设备上已经删掉了」这条推断，只有在列表可信时才成立：
+    ///   一次抖动的读列表会把用户排的整个删除队列**静默清空**，
+    ///   连日志都没有，待删角标也跟着消失（2026-09-07 review）。
     func runPendingDeletes(client: BLEClient, entries: [FileEntry],
-                           recordStatus: UInt8?) async -> Int {
+                           recordStatus: UInt8?, listComplete: Bool) async -> Int {
         guard !pendingDeviceDelete.isEmpty else { return 0 }
         guard recordStatus == 2 else {
             log.write("设备不在「未录音」状态，本轮不执行人工删除")
             return 0
         }
+        guard listComplete else {
+            log.write("文件列表这轮不完整，人工删除队列原样留着（\(pendingDeviceDelete.count) 条）")
+            return 0
+        }
         var done = 0
         for base in pendingDeviceDelete {
             guard let entry = entries.first(where: { $0.base == base }) else {
-                pendingDeviceDelete.remove(base)      // 设备上已经没有了
+                // 列表可信、里面没有它 → 确实已经不在设备上了。留一句痕迹：
+                // 用户排过的动作凭空消失，哪怕结果是对的也该看得见。
+                pendingDeviceDelete.remove(base)
+                log.write("\(base) 已不在设备上，从待删队列移除")
                 continue
             }
-            guard let r = try? await client.deleteOne(entry) else { continue }
+            guard let r = try? await client.deleteOne(entry) else {
+                // 用户明确要求删的东西没删成，不能一声不吭（原来是裸 continue）。
+                log.write("删除 \(base) 时抛错，留在队列里下次再试")
+                continue
+            }
             if r.0 {
                 done += 1
                 pendingDeviceDelete.remove(base)

@@ -96,6 +96,24 @@ struct RecordingDetailView: View {
                     .buttonStyle(DSSecondaryButtonStyle())
             }
 
+            // 下载连续失败到阈值之后，引擎就不再自动重试了（否则一条结构性
+            // 坏掉的条目会永远占用每一轮的连接时间——实测一条 9 天试了 97 次）。
+            // 但「不再自动」必须配一个「手动能再来」，否则那条录音对引擎
+            // 就是永久不可见了。这个按钮同时清导入记录和失败计数。
+            if item.onDevice {
+                Button("重新下载") { model.actions.redownload(item) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .help("清掉这条的下载记录与失败计数，下次连上录音笔重新拉一遍")
+            }
+
+            // 转写失败的才给重推。永久失败（比如 INVALID_ASR_TIMELINE）重推一百次
+            // 结果都一样，那种不给按钮——给了等于骗人白等（BrainFailure.retryable）。
+            if item.brainStatus == "failed", BrainFailure.retryable(item.brainErrorCode) {
+                Button("重新推送") { model.actions.repush(item) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .help("换一个幂等键重新建会话推一遍")
+            }
+
             Button(item.starred ? "取消收藏" : "收藏") { model.actions.toggleStar(item) }
                 .buttonStyle(DSSecondaryButtonStyle())
 

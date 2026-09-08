@@ -35,7 +35,9 @@ enum RailSection: String, CaseIterable, Identifiable {
 struct SideRail: View {
     @Environment(\.colorScheme) private var scheme
     @Binding var section: RailSection
-    /// 设备连着没有。红点比一行字更早被看见。
+    /// 录音笔在不在线。**同步期间一律算在线**——CB08 是「连上传十几秒就断、
+    /// 然后再连」的节奏，按瞬时状态画这个点，同步时它会一直闪
+    /// （2026-09-08 用户看到的正是这种自相矛盾：顶栏在下载，设备页写未连接）。
     let deviceConnected: Bool
 
     var body: some View {
@@ -132,14 +134,15 @@ struct DevicePage: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image(systemName: dev.connected ? "dot.radiowaves.left.and.right" : "wifi.slash")
+            Image(systemName: working || dev.connected ? "dot.radiowaves.left.and.right" : "wifi.slash")
                 .font(.system(size: 20))
-                .foregroundStyle(dev.connected ? DS.focus : DS.muted)
+                .foregroundStyle(working || dev.connected ? DS.focus : DS.muted)
             VStack(alignment: .leading, spacing: 2) {
                 Text(dev.name).font(DS.bodyFont(DS.T.head, .semibold))
                     .foregroundStyle(DS.title(scheme == .dark))
-                Text(dev.connected ? "已连接" : "未连接——录音笔开机后会自动广播，这里就会亮")
+                Text(connectionLine)
                     .font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.muted)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
             if dev.connected, dev.recordStatus == 1 {
@@ -153,10 +156,43 @@ struct DevicePage: View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)],
                   alignment: .leading, spacing: 10) {
             // 断开之后电量是上次同步的读数，不是现状——所以断开时不摆数字。
-            stat("电量", dev.connected ? battery : "—")
+            // 但「—」不该被当成「读不出来」：同步忙起来时本来就不去读这几项
+            // （窗口要留给传输），空闲那一轮才读。所以这里把「还没读到」
+            // 和「设备不在」分开说，别让人以为哪里坏了。
+            stat("电量", dev.connected ? battery : (dev.battery == nil ? idleHint : "—"))
             stat("容量", capacity)
-            stat("固件", dev.connected ? (dev.firmware ?? "—") : "—")
+            stat("固件", dev.connected ? (dev.firmware ?? "—") : (dev.firmware ?? idleHint))
             stat("等着导入", pendingImport == 0 ? "都导完了" : "\(pendingImport) 条")
+        }
+    }
+
+    /// 「此刻连着没有」这个瞬时值，不能直接当成给人看的状态。
+    ///
+    /// CB08 的实际工作方式是**连上→传十几秒→被设备断开→再连**，一轮一轮来
+    /// （2026-09-08 实测：一个 4MB 的文件是分十几次连接搬回来的）。
+    /// 于是任意一个瞬间去看，多半正好在两次连接之间——界面就写着「未连接」，
+    /// 而顶栏同时显示「下载 21%」。用户看到的是两句互相矛盾的话，
+    /// 而真相是一切正常。
+    ///
+    /// 所以这里按**正在做的事**说话，而不是按那一瞬间的 BLE 状态。
+    /// 正在跟录音笔打交道（哪怕此刻恰好断在两次连接之间）。
+    private var working: Bool {
+        switch model.phase {
+        case .downloading, .listing, .connecting, .cleaning: return true
+        default: return false
+        }
+    }
+
+    private var connectionLine: String {
+        switch model.phase {
+        case .downloading(_, let pct):
+            return "正在同步 \(pct)%——录音笔每传十几秒会断开一次再自动连上，这是它的正常节奏"
+        case .listing, .connecting:
+            return "正在读取录音笔"
+        case .cleaning:
+            return "正在清理录音笔"
+        default:
+            return dev.connected ? "已连接" : "未连接——录音笔开机后会自动广播，这里就会亮"
         }
     }
 
@@ -164,6 +200,10 @@ struct DevicePage: View {
         guard let b = dev.battery else { return "—" }
         return b == 110 ? "充电中" : "\(b)%"
     }
+
+    /// 还没读到这几项时给的话。它们只在「这一轮没东西要下」时才读——
+    /// 正在搬文件的时候，那十几秒的窗口全都留给传输。
+    private var idleHint: String { model.isBusy ? "同步中，稍后读" : "—" }
 
     private var capacity: String {
         guard dev.connected, let remain = dev.capacityRemain, let total = dev.capacityTotal,

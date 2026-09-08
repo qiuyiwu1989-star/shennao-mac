@@ -414,6 +414,23 @@ do {
 // （实测一整天 108 次连接、0 次成功）。现在断点落盘、跨连接接着传。
 // 但接错的代价很重：拼出来的会是一段前后不属于同一个文件的字节，
 // 而它可能恰好整除 40、总长也刚好凑够，完整性硬闸未必拦得住。
+// MARK: - 自动生成的设备号必须过得了服务端校验
+//
+// 2026-09-08：Mac 的机器名天生带空格（实测 Host.current().localizedName
+// 是「qiu的MacBook Air」），而服务端 isValidDeviceNo 不收任何空白。
+// 于是每次自动绑定都被判 device_no_invalid，客户端把它显示成
+// 「名字里有空格或特殊字符，换一个」，然后又生成同样带空格的名字重试——
+// 自己跟自己打架。写那段代码时我没实际看过它返回什么，是想当然。
+print("\n自动设备号的清洗")
+do {
+    check("空格换成连字符", SyncPlanner.safeDeviceNo("CB08-qiu的MacBook Air"), "CB08-qiu的MacBook-Air")
+    check("多个连续空格不产生空段", SyncPlanner.safeDeviceNo("a   b"), "a-b")
+    check("首尾空白不留下悬空连字符", SyncPlanner.safeDeviceNo("  x  "), "x")
+    check("换行也算空白", SyncPlanner.safeDeviceNo("a\nb"), "a-b")
+    check("没有空白的原样返回", SyncPlanner.safeDeviceNo("CB08-Mac"), "CB08-Mac")
+    check("超长截到 64", SyncPlanner.safeDeviceNo(String(repeating: "x", count: 100)).count, 64)
+}
+
 print("\n跨连接断点的可用性判据")
 do {
     check("大小一致、整包边界、还没下完 → 可用",

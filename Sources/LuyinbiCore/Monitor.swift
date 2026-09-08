@@ -246,6 +246,21 @@ public enum SyncPlanner {
     /// 判据只认硬证据：本地裸包大小 == 设备报的大小，且能被 40 整除
     /// （40 B = 20 ms，除不尽就是截断）。差一个字节都按没下完处理——
     /// 宁可重下，也不能把半截录音当成完整的推上去。
+    /// 把一个人可读的名字变成服务端收得下的设备号。
+    ///
+    /// 服务端 `isValidDeviceNo` 的要求：非空、不超过 64、**不含任何空白**。
+    /// Mac 的机器名天生带空格（实测 `Host.current().localizedName` 是
+    /// 「qiu的MacBook Air」），直接拿去注册每次都被判 device_no_invalid——
+    /// 而客户端把这个错误显示成「名字里有空格或特殊字符，换一个」，
+    /// 却又自动生成同样带空格的名字重试，自己跟自己打架。
+    public static func safeDeviceNo(_ raw: String) -> String {
+        let collapsed = raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        return String(collapsed.prefix(64))
+    }
+
     /// 连续失败多少次之后不再自动重试。
     ///
     /// 5 次的来历：真实的可恢复失败（信号弱、设备正忙、连接抖动）实测最多两三次
@@ -699,9 +714,31 @@ public final class SyncEngine: ObservableObject {
     /// 有新东西就立刻把间隔打回 60 秒，所以"录完马上就同步"的体验不受影响。
     private static let idleBackoff: [TimeInterval] = [60, 120, 300, 600]
 
+    /// 正在续传某个文件时的重连间隔。
+    ///
+    /// 2026-09-08 实测：设备连上约 8 秒必被断，每次能拿 ~230KB（29KB/s，
+    /// 满速）。断点续传打通之后，**决定一个文件要多久传完的就只剩重连频率**。
+    /// 而原来的判据是「这一轮有没有导完整条」——续传涨了 6% 照样算空转，
+    /// 退避一路推到 600 秒，那条 15.5MB 的录音按这个节奏要传 18 小时。
+    ///
+    /// 冷却本来是为了防「设备就在手边时一天连几百次」——那说的是**空转**的连接：
+    /// 耗设备的电、挡着手机连它、还让它回不到低功耗广播。
+    /// 而正在把一个文件一段一段搬回来的连接不是空转，它每次都在干活，
+    /// 该尽快再来一次。15 秒是留给设备重新广播的时间。
+    private static let resumingCooldown: TimeInterval = 15
+
     private func currentCooldown(_ key: String) -> TimeInterval {
+        // 有断点没传完 = 正在搬一个文件，走快车道，不受空转退避约束。
+        if resumingInProgress { return Self.resumingCooldown }
         let n = min(idleRounds[key] ?? 0, Self.idleBackoff.count - 1)
         return max(cooldown, Self.idleBackoff[n])
+    }
+
+    /// 磁盘上还有没有没传完的断点。有就说明「活干到一半」，重连要快。
+    private var resumingInProgress: Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: paths.rawPackets.path)
+        else { return false }
+        return names.contains { $0.hasSuffix(".part") }
     }
 
     /// 一轮同步结束后调用：有产出就清零退避，没有就加一档。
@@ -846,6 +883,17 @@ public final class SyncEngine: ObservableObject {
                                        localRaw: rawOnDisk)
         let skipped = entries.count - todo.count
 
+        // **没有要下的东西时，才去读电量/固件/容量。**
+        //
+        // 这几项纯粹给「设备」页看，一项都不参与判断。放在有活干的那一轮里读，
+        // 会吃掉本就只有 8~20 秒的传输窗口（这正是 1.2.0 之前一整天下不动的原因之一）；
+        // 而放在干完活之后读又永远读不到——设备传着传着就断了，根本撑不到那一步，
+        // 于是设备页上电量容量固件长期是「—」（1.2.0 上线后用户立刻发现了这个）。
+        // 空闲的那一轮没有这个矛盾：反正没别的事，几秒钟的读取代价可以忽略。
+        if todo.isEmpty {
+            await readDisplayInfo(client)
+        }
+
         // **把「为什么没下」写清楚。** 2026-09-08 排查时最卡人的一点就是：
         // 日志只说「跳过 N 条已导」，而设备上明明有一条两小时的录音没下下来。
         // 到底是已记账、还是被当成正在录、还是攒够失败次数被放弃了，
@@ -869,6 +917,8 @@ public final class SyncEngine: ObservableObject {
         }
 
         var imported = 0
+        /// 这一轮断点有没有往前走。它和「导完整条」一样算产出——见 noteRoundOutcome。
+        var advancedPartial = false
         for e in todo {
             let base = SyncPlanner.normalizedBase(e.name)
             errors[base] = nil
@@ -907,6 +957,7 @@ public final class SyncEngine: ObservableObject {
             // 也不记失败计数——设备主动断链是常态（实测每 8 秒一次），
             // 把它算成「这个文件有问题」，五轮之后就会被误判成僵尸条目放弃掉。
             if res.disconnected {
+                if res.data.count > partial.count { advancedPartial = true }
                 savePartial(base: base, announced: e.size, bytes: res.data)
                 let pct = Double(res.data.count) / Double(max(e.size, 1)) * 100
                 errors[base] = String(format: "传到 %.0f%% 时设备断开了，下次连上接着传", pct)
@@ -1045,8 +1096,8 @@ public final class SyncEngine: ObservableObject {
             if r.deleted > 0 { refreshLocalView() }
         }
 
-        // 活干完了，这时候才去读电量/固件/容量这些纯显示的。
-        // 断了就算了——界面上留着上次的读数，比抢在前面读、把下载窗口吃掉强。
+        // 活干完了、连接还在的话顺手再读一次（多半读不到，因为设备通常已经断了；
+        // 真正保证能读到的是上面那条「空闲轮才读」的路径）。
         await readDisplayInfo(client)
 
         // **碰设备的事全做完了，立刻放掉蓝牙，再去推深脑。**
@@ -1083,8 +1134,10 @@ public final class SyncEngine: ObservableObject {
         if imported > 0 || uploaded > 0 || !cleanNote.isEmpty {
             Notify.send(lastSummary)
         }
+        // **断点前进也算有产出。** 只认「导完整条」会把续传中的每一轮都判成空转，
+        // 于是越传越慢——而它明明每一轮都在往前走。
         noteRoundOutcome(target.peripheral.identifier.uuidString,
-                         productive: imported > 0 || uploaded > 0)
+                         productive: imported > 0 || uploaded > 0 || advancedPartial)
         phase = monitoring ? .waitingForDevice : .idle
     }
 
@@ -1205,7 +1258,7 @@ public final class SyncEngine: ObservableObject {
         let rawSizes = scanLocal(paths.rawPackets, ext: "opus")
         let now = Date()
         var ok = 0
-        for (idx, job) in uploadQueue.enumerated() {
+        for job in uploadQueue {
             guard force || job.nextAttempt <= now else { continue }
             let base = job.base
             // **同一轮里，被上一条合并进去的段不能再单独推一遍。**
@@ -1669,7 +1722,10 @@ public final class SyncEngine: ObservableObject {
             log.write("首次绑定「\(target.name)」暂时跳过：深脑接不通（登录可能失效了），本轮先同步，下次连接再试绑定")
             return true
         }
-        let defaultName = "\(target.name)-\(Host.current().localizedName ?? "Mac")"
+        // `Host.current().localizedName` 实测返回「qiu的MacBook Air」——**带空格**，
+        // 而服务端的 isValidDeviceNo 不收空格，于是每次都被判 device_no_invalid。
+        // 写这段时我没有实际看过它返回什么，是想当然（2026-09-08 实测才发现）。
+        let defaultName = SyncPlanner.safeDeviceNo("\(target.name)-\(Host.current().localizedName ?? "Mac")")
         let first = await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
                                      deviceNo: defaultName, brain: brain)
         if first.ok {

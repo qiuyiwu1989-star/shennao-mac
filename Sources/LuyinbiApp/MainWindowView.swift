@@ -52,7 +52,7 @@ struct MainWindowView: View {
             Divider()
             HStack(spacing: 0) {
                 SideRail(section: $section,
-                         deviceConnected: model.device.connected)
+                         deviceConnected: model.device.connected || model.isBusy)
                     .frame(width: 132)
                 Divider()
                 switch section {

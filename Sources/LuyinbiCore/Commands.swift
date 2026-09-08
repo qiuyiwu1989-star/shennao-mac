@@ -74,6 +74,9 @@ public extension BLEClient {
         public var seconds: Double = 0
         public var resumes = 0
         public var tried: [String] = []
+        /// 这次是被断线打断的（不是设备说完成、也不是设备拒绝）。
+        /// 调用方据此决定：存断点、下次续传，而不是记一次「下载失败」。
+        public var disconnected = false
         public var ok: Bool { endCode == 0 && !data.isEmpty }
         public var kbps: Double { seconds > 0 ? Double(data.count) / 1024 / seconds : 0 }
     }
@@ -87,19 +90,43 @@ public extension BLEClient {
     /// `idleTimeout` 秒的空档——蓝牙在弱信号下做不到。以前写死 5 次，用完就放弃，
     /// 而放弃后下一轮**从 0 重来**，于是这条录音整天在 30%→90%→30% 之间打转，
     /// 一个字节都没存下来。传 nil 就按每 MB 给 2 次、下限 8 次算。
+    /// - Parameter resumeFrom: 上一次连接里已经收到、并且已经落到磁盘上的字节。
+    ///   非空时从 `resumeFrom.count` 这个偏移接着要，而不是从 0 重来。
+    ///
+    ///   **为什么必须跨连接续传**：2026-09-08 实测，CB08 连上约 8 秒就主动断链，
+    ///   而 15.5MB 的两小时录音在 27KB/s 下要传 10 分钟。原来的续传只在
+    ///   同一条连接内有效——设备一断，sendRaw 抛错、整个 download 失败，
+    ///   已经收到的几百 KB 全部丢弃，下一轮从 0 再来。
+    ///   于是**这条文件永远下不完**：一整天 108 次连接、0 次成功。
+    ///   协议本身早就支持 offset（buildImportRequest 就带这个参数），
+    ///   缺的只是让进度活过一次断线。
+    ///
+    /// - Returns: 即使中途断了也会带回 `data`（已收到的部分），
+    ///   由调用方决定要不要存成断点。
     func download(candidates: [String], expectSize: UInt32? = nil,
                   idleTimeout: TimeInterval = 12, maxResumes: Int? = nil,
+                  resumeFrom: [UInt8] = [],
                   onProgress: ((Int, UInt32?) -> Void)? = nil) async throws -> DownloadResult {
         var res = DownloadResult()
         let resumeBudget = maxResumes
             ?? max(8, Int((expectSize.map(Double.init) ?? 0) / 1_048_576 * 2))
         for name in candidates {
             res.tried.append(name); res.filename = name
-            var buf: [UInt8] = []
+            var buf: [UInt8] = resumeFrom
             let started = Date()
             var resumes = 0
             while true {
-                try sendRaw(try Proto.buildImportRequest(name, offset: UInt32(buf.count), seq: nextSeq()))
+                do {
+                    try sendRaw(try Proto.buildImportRequest(name, offset: UInt32(buf.count), seq: nextSeq()))
+                } catch {
+                    // 断线了。**把已经收到的字节带回去**，别让它随异常一起蒸发——
+                    // 调用方会把它存成断点，下次连上从这里接着要。
+                    res.data = buf
+                    res.seconds = Date().timeIntervalSince(started)
+                    res.resumes = resumes
+                    res.disconnected = true
+                    return res
+                }
                 var stalled = false
                 var last = Date()
                 while true {

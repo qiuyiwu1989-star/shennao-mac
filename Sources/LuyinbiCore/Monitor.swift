@@ -269,6 +269,23 @@ public enum SyncPlanner {
         }
     }
 
+    /// 一份断点还能不能接着用。
+    ///
+    /// **安全关键，所以抽成纯函数**（跟 downloadComplete 同一条理由）：判错一次，
+    /// 拼出来的就是一段前后不属于同一个文件的字节——而它长度可能恰好是 40 的
+    /// 整数倍、总大小也可能刚好凑够，下载完整性硬闸未必拦得住。
+    ///
+    /// - Parameters:
+    ///   - savedFor: 存这份断点时、设备声称的大小
+    ///   - announced: 这一次设备声称的大小
+    public static func partialUsable(bytes: Int, savedFor: UInt32?, announced: UInt32) -> Bool {
+        // 设备这次报的大小跟存断点那次不一样 → 这个文件变了（还在录 / 被替换 /
+        // 是另一个同名文件），断点作废。
+        guard let savedFor, savedFor == announced else { return false }
+        guard bytes > 0, bytes < Int(announced) else { return false }   // 空的没用；够了就不叫断点
+        return bytes % 40 == 0                                          // 必须停在整包边界
+    }
+
     /// 攒够次数、已经被自动重试放弃的条目。界面据此显示「试了 N 次都没成，点这里再试」。
     public static func givenUp(entries: [FileEntry], manifest: SyncManifest) -> [FileEntry] {
         entries.filter { (manifest.downloadFailures[manifestKey($0)] ?? 0) >= giveUpAfter }
@@ -757,7 +774,9 @@ public final class SyncEngine: ObservableObject {
 
         guard await ensureDeviceBinding(target) else { return }
 
-        await readDeviceInfo(client)
+        // 顺序就是优先级：先拿到能不能下载的判据，再拉列表干活，
+        // 显示用的读数留到最后（见 readSyncCriticalInfo 的注释）。
+        await readSyncCriticalInfo(client)
 
         phase = .listing
         let entries: [FileEntry]
@@ -773,6 +792,7 @@ public final class SyncEngine: ObservableObject {
         }
         lastEntries = entries
         refreshLocalView()
+        log.write("列表回来 \(entries.count) 条\(gotDone ? "" : "（未收到 2-18 结束帧，可能不完整）")")
 
         var manifest = SyncManifest.load(from: paths.manifest)
         let rawOnDisk = scanLocal(paths.rawPackets, ext: "opus")
@@ -826,6 +846,28 @@ public final class SyncEngine: ObservableObject {
                                        localRaw: rawOnDisk)
         let skipped = entries.count - todo.count
 
+        // **把「为什么没下」写清楚。** 2026-09-08 排查时最卡人的一点就是：
+        // 日志只说「跳过 N 条已导」，而设备上明明有一条两小时的录音没下下来。
+        // 到底是已记账、还是被当成正在录、还是攒够失败次数被放弃了，
+        // 从日志里一个字都看不出来，只能对着代码反推。这几行就是补这个。
+        if todo.isEmpty && !entries.isEmpty {
+            var already = 0, live = 0, gaveUp = 0, haveLocal = 0
+            for e in entries {
+                let key = SyncPlanner.manifestKey(e)
+                if manifest.imported[key] != nil { already += 1 }
+                else if SyncPlanner.isLive(e, status: lastStatus, current: lastCurrent) { live += 1 }
+                else if (manifest.downloadFailures[key] ?? 0) >= SyncPlanner.giveUpAfter { gaveUp += 1 }
+                else if let have = rawOnDisk[SyncPlanner.normalizedBase(e.name)],
+                        have == Int(e.size), have % 40 == 0, have > 0 { haveLocal += 1 }
+            }
+            log.write("这一轮没有要下的：已记账 \(already) / 正在录 \(live)"
+                      + " / 试够次数放弃 \(gaveUp) / 本地已有完整副本 \(haveLocal)")
+        } else if !todo.isEmpty {
+            log.write("要下 \(todo.count) 条："
+                      + todo.prefix(5).map { SyncPlanner.normalizedBase($0.name) }.joined(separator: "、")
+                      + (todo.count > 5 ? " …" : ""))
+        }
+
         var imported = 0
         for e in todo {
             let base = SyncPlanner.normalizedBase(e.name)
@@ -833,10 +875,21 @@ public final class SyncEngine: ObservableObject {
             let throttle = ProgressThrottle()
             phase = .downloading(base, 0)
 
+            // 断点：上一次连接收到一半的字节。设备声称的大小必须和当时一致——
+            // 对不上说明这个文件在设备上变了（还在录、或者被换过），
+            // 那份断点就不能接着用，从头来。
+            let partial = loadPartial(base: base, announced: e.size)
+            if !partial.isEmpty {
+                log.write(String(format: "接着上次的断点续传 %@：已有 %d/%@ B（%.0f%%）",
+                                 base, partial.count, String(e.size),
+                                 Double(partial.count) / Double(max(e.size, 1)) * 100))
+            }
+
             let res: BLEClient.DownloadResult
             do {
                 res = try await client.download(
                     candidates: e.candidates, expectSize: e.size,
+                    resumeFrom: partial,
                     onProgress: { [weak self] got, expect in
                         guard let expect, expect > 0 else { return }
                         let pct = min(100, Int(Double(got) / Double(expect) * 100))
@@ -848,6 +901,20 @@ public final class SyncEngine: ObservableObject {
                 errors[base] = describe(error)
                 refreshLocalView()
                 continue
+            }
+
+            // **被断线打断 ≠ 下载失败。** 存成断点，下次连上接着要，
+            // 也不记失败计数——设备主动断链是常态（实测每 8 秒一次），
+            // 把它算成「这个文件有问题」，五轮之后就会被误判成僵尸条目放弃掉。
+            if res.disconnected {
+                savePartial(base: base, announced: e.size, bytes: res.data)
+                let pct = Double(res.data.count) / Double(max(e.size, 1)) * 100
+                errors[base] = String(format: "传到 %.0f%% 时设备断开了，下次连上接着传", pct)
+                log.write(String(format: "断线中断 %@：已存断点 %d/%@ B（%.0f%%），不计失败",
+                                 base, res.data.count, String(e.size), pct))
+                refreshLocalView()
+                // 设备都断了，这一轮剩下的也别再试了，白等超时。
+                break
             }
 
             guard res.ok else {
@@ -924,6 +991,7 @@ public final class SyncEngine: ObservableObject {
             // 不清的话一条平时偶尔抖一下的文件，攒够五次就再也不自动下了。
             manifest.downloadFailures[SyncPlanner.manifestKey(e)] = nil
             persist(manifest)
+            dropPartial(base)          // 这条已经完整拿到了，断点没用了
             imported += 1
             log.write("导入 \(outName) \(res.data.count)B \(String(format: "%.1f", res.kbps))KB/s"
                       + (res.resumes > 0 ? " 续传\(res.resumes)次" : ""))
@@ -976,6 +1044,10 @@ public final class SyncEngine: ObservableObject {
             }
             if r.deleted > 0 { refreshLocalView() }
         }
+
+        // 活干完了，这时候才去读电量/固件/容量这些纯显示的。
+        // 断了就算了——界面上留着上次的读数，比抢在前面读、把下载窗口吃掉强。
+        await readDisplayInfo(client)
 
         // **碰设备的事全做完了，立刻放掉蓝牙，再去推深脑。**
         //
@@ -1034,24 +1106,47 @@ public final class SyncEngine: ObservableObject {
         }
     }
 
-    private func readDeviceInfo(_ client: BLEClient) async {
+    /// **同步必需的两项**：设备在不在录、在录哪一个。
+    ///
+    /// 只读这两项，且**放在连接之后的第一步**。原来是先读电量/固件/增益/容量
+    /// 再读这两项，六个串行 BLE 往返、最坏 25 秒——而 2026-09-08 实测
+    /// 设备连上约 8 秒就主动断链，于是窗口的一大半花在纯显示信息上，
+    /// 真正要干的活（拉列表、下载）还没开始就断了，一整天 0 次成功下载。
+    ///
+    /// `currentFilename` 只在设备自称在录时才问：它**没在录的时候本来就没有
+    /// 「当前文件」**，白问一次要干等 4 秒超时——正是那 8 秒里最大的一笔浪费。
+    private func readSyncCriticalInfo(_ client: BLEClient) async {
+        device.recordStatus = (try? await client.recordStatus()) ?? nil
+        lastStatus = device.recordStatus
+        if lastStatus == 1 || lastStatus == 3 {
+            lastCurrent = (try? await client.currentFilename()) ?? nil
+            if lastCurrent == nil {
+                log.write("设备说在录（状态 \(lastStatus.map(String.init) ?? "?")）却读不到当前文件名"
+                          + "——这一批全部按「可能正在录」跳过，不冒截断的险")
+            }
+        } else {
+            // 明确没在录：不存在「当前文件」，这一项就是 nil，不用去问。
+            lastCurrent = nil
+        }
+        if lastStatus == nil {
+            log.write("读不到录音状态——本轮仍按「没在录」处理（分不清读失败和固件不支持，"
+                      + "一律拦会让老固件永远同步不了，见 SyncPlanner.isLive）")
+        }
+    }
+
+    /// **纯显示信息**：电量、固件、增益、容量。设备页拿来摆着看的，
+    /// 一项都不参与「要不要下载」的判断，所以放到干完活之后再读——
+    /// 断线了就这一轮不更新，界面上还是上次的读数，没有任何损失。
+    private func readDisplayInfo(_ client: BLEClient) async {
+        guard client.isConnected else { return }
         device.battery = (try? await client.battery()) ?? nil
         checkBattery(device.battery)
+        guard client.isConnected else { return }
         device.firmware = (try? await client.firmware()) ?? nil
         device.gain = (try? await client.gain()) ?? nil
-        device.recordStatus = (try? await client.recordStatus()) ?? nil
         if let cap = (try? await client.capacity()) ?? nil {
             device.capacityRemain = cap.remain
             device.capacityTotal = cap.total
-        }
-        lastStatus = device.recordStatus
-        lastCurrent = (try? await client.currentFilename()) ?? nil
-        // 这两个值是「不许碰正在录的那条」那道闸的全部输入（SyncPlanner.isLive）。
-        // 读不到不是小事，必须留痕——以前它们和电量固件一样被 try? 一起吞掉，
-        // 而闸失效时日志里一个字都没有。
-        if lastStatus == nil || lastCurrent == nil {
-            log.write("设备状态读不全（录音状态 \(lastStatus.map(String.init) ?? "读不到")"
-                      + "、当前文件 \(lastCurrent ?? "读不到")）——这一轮按最坏情况处理，可能整批跳过")
         }
     }
 
@@ -1455,6 +1550,46 @@ public final class SyncEngine: ObservableObject {
         }
     }
 
+    // MARK: - 跨连接断点
+    //
+    // 断点存在 `原始包/<base>.part`，旁边一个 `.part.size` 记着**当时设备
+    // 声称的大小**。下次续传前必须核对这个大小：对不上就说明这个文件在设备上
+    // 变了（还在录、被替换、或者是另一个同名文件），那份断点接着用会拼出
+    // 一段前后不属于同一个文件的字节——而它长度可能恰好是 40 的整数倍、
+    // 大小也可能刚好凑够，完整性硬闸未必拦得住。宁可从头下。
+
+    private func partialURL(_ base: String) -> URL {
+        paths.rawPackets.appendingPathComponent("\(base).part")
+    }
+    private func partialSizeURL(_ base: String) -> URL {
+        paths.rawPackets.appendingPathComponent("\(base).part.size")
+    }
+
+    private func loadPartial(base: String, announced: UInt32) -> [UInt8] {
+        let savedFor = (try? String(contentsOf: partialSizeURL(base), encoding: .utf8))
+            .flatMap { UInt32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard let data = try? Data(contentsOf: partialURL(base)),
+              SyncPlanner.partialUsable(bytes: data.count, savedFor: savedFor, announced: announced) else {
+            dropPartial(base)          // 对不上就丢掉重来，绝不将就
+            return []
+        }
+        return [UInt8](data)
+    }
+
+    private func savePartial(base: String, announced: UInt32, bytes: [UInt8]) {
+        // 只存整包边界的部分。最后那个不完整的包丢掉，下次从整包处接着要——
+        // 40 字节的代价，换掉一整类错位风险。
+        let keep = bytes.count - (bytes.count % 40)
+        guard keep > 0 else { dropPartial(base); return }
+        try? Data(bytes.prefix(keep)).write(to: partialURL(base), options: .atomic)
+        try? String(announced).write(to: partialSizeURL(base), atomically: true, encoding: .utf8)
+    }
+
+    private func dropPartial(_ base: String) {
+        try? FileManager.default.removeItem(at: partialURL(base))
+        try? FileManager.default.removeItem(at: partialSizeURL(base))
+    }
+
     /// 记一次下载失败。攒够 `SyncPlanner.giveUpAfter` 次就不再自动重试这一条。
     ///
     /// 每次都立刻写回磁盘，不攒到本轮结束——这份账要跨重启活着才有意义
@@ -1535,31 +1670,46 @@ public final class SyncEngine: ObservableObject {
             return true
         }
         let defaultName = "\(target.name)-\(Host.current().localizedName ?? "Mac")"
-        if await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
-                            deviceNo: defaultName, brain: brain) {
+        let first = await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
+                                     deviceNo: defaultName, brain: brain)
+        if first.ok {
             log.write("首次绑定「\(target.name)」到当前账号「\(currentEmail)」，命名为「\(defaultName)」")
             return true
         }
-        // 撞名重试一次（同一台 Mac 主机名 + 设备名组合被占，概率很低但不是零）。
-        let retryName = "\(defaultName)-\(Int.random(in: 100...999))"
-        if await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
-                            deviceNo: retryName, brain: brain) {
-            log.write("首次绑定「\(target.name)」到当前账号「\(currentEmail)」，命名为「\(retryName)」（原名字被占用）")
+        // **只有真的撞名才值得换个名字重试。** 401 / 网络错误换名字一样会失败，
+        // 白白再花掉一次网络往返——而这段跑在蓝牙连接窗口里，那个窗口很短。
+        if case "这个名字已被占用" = first.why {
+            let retryName = "\(defaultName)-\(Int.random(in: 100...999))"
+            let second = await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
+                                          deviceNo: retryName, brain: brain)
+            if second.ok {
+                log.write("首次绑定「\(target.name)」到「\(currentEmail)」，命名为「\(retryName)」（原名字被占用）")
+                return true
+            }
+            log.write("绑定「\(target.name)」失败：换名后仍不成——\(second.why)。本轮跳过绑定，照常同步")
             return true
         }
-        // 绑定登记失败不是"账号不对"的安全风险，只是元数据没记上——
-        // 不该因为这个把一支笔本该正常的同步卡住，下次连接会自然重试。
-        log.write("绑定「\(target.name)」失败：重试后仍冲突，本轮跳过绑定但照常同步")
+        log.write("绑定「\(target.name)」失败：\(first.why)。本轮跳过绑定，照常同步")
         return true
     }
 
+    /// - Returns: 成功与否，以及**失败的真实原因**。
+    ///
+    /// 原来只返回 Bool，调用方于是一律写成「重试后仍冲突」。2026-09-08 实测：
+    /// 真正的返回是 **401**（服务端那个端点当时只认 cookie，不认原生 Bearer），
+    /// 跟重名毫无关系。日志里那句「仍冲突」把排查引向了完全错误的方向，
+    /// 而它每 10 分钟就说一次、说了好几天。
+    /// **断言原因之前必须先拿到原因。**
     private func bindDevice(_ peripheralId: String, orgId: String, email: String,
-                            deviceNo: String, brain: DeepBrain) async -> Bool {
-        guard case .ok = await brain.selfRegisterDevice(provider: "cb08", deviceNo: deviceNo) else {
-            return false
+                            deviceNo: String, brain: DeepBrain) async -> (ok: Bool, why: String) {
+        switch await brain.selfRegisterDevice(provider: "cb08", deviceNo: deviceNo) {
+        case .ok:
+            DeviceBinding.bind(peripheralId, orgId: orgId, email: email, deviceNo: deviceNo)
+            return (true, "")
+        case .deviceTaken:   return (false, "这个名字已被占用")
+        case .unauthorized:  return (false, "登录失效（服务端不认这次请求）")
+        case .failed(let m): return (false, m)
         }
-        DeviceBinding.bind(peripheralId, orgId: orgId, email: email, deviceNo: deviceNo)
-        return true
     }
 
     /// 界面调用：账号不匹配警告里用户点了「继续」——把这支笔重新绑给当前账号。
@@ -1575,8 +1725,12 @@ public final class SyncEngine: ObservableObject {
         let currentEmail = DeepBrain.signedInEmail ?? "当前账号"
         let name = newDeviceName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return false }
-        guard await bindDevice(mismatch.peripheralId, orgId: currentOrg, email: currentEmail,
-                               deviceNo: name, brain: brain) else { return false }
+        let r = await bindDevice(mismatch.peripheralId, orgId: currentOrg, email: currentEmail,
+                                 deviceNo: name, brain: brain)
+        guard r.ok else {
+            log.write("换绑「\(mismatch.deviceName)」失败：\(r.why)")
+            return false
+        }
         log.write("确认换绑「\(mismatch.deviceName)」到「\(currentEmail)」，命名为「\(name)」")
         pendingBindMismatch = nil
         if isFailed(phase) { phase = .waitingForDevice }

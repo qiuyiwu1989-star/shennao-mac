@@ -407,6 +407,31 @@ do {
     check("真裸包不是已知容器", OggWrap.isKnownContainer(raw), false)
 }
 
+// MARK: - 跨连接断点能不能接着用
+//
+// 2026-09-08：CB08 连上约 8 秒就主动断链，而 15.5MB 的两小时录音要传 10 分钟。
+// 原来的续传只在同一条连接内有效，一断就把已收字节全丢——那条文件永远下不完
+// （实测一整天 108 次连接、0 次成功）。现在断点落盘、跨连接接着传。
+// 但接错的代价很重：拼出来的会是一段前后不属于同一个文件的字节，
+// 而它可能恰好整除 40、总长也刚好凑够，完整性硬闸未必拦得住。
+print("\n跨连接断点的可用性判据")
+do {
+    check("大小一致、整包边界、还没下完 → 可用",
+          SyncPlanner.partialUsable(bytes: 4000, savedFor: 21_602_000, announced: 21_602_000), true)
+    check("设备这次报的大小变了 → 作废（文件在设备上变过）",
+          SyncPlanner.partialUsable(bytes: 4000, savedFor: 21_602_000, announced: 21_602_040), false)
+    check("没记下当时的大小 → 作废（无从核对）",
+          SyncPlanner.partialUsable(bytes: 4000, savedFor: nil, announced: 21_602_000), false)
+    check("停在半个包上 → 作废（接着传会整体错位）",
+          SyncPlanner.partialUsable(bytes: 4001, savedFor: 21_602_000, announced: 21_602_000), false)
+    check("空断点没有意义",
+          SyncPlanner.partialUsable(bytes: 0, savedFor: 21_602_000, announced: 21_602_000), false)
+    check("已经够了就不该叫断点",
+          SyncPlanner.partialUsable(bytes: 21_602_000, savedFor: 21_602_000, announced: 21_602_000), false)
+    check("超过声称大小更不能用",
+          SyncPlanner.partialUsable(bytes: 21_602_040, savedFor: 21_602_000, announced: 21_602_000), false)
+}
+
 print("\n设备切分识别")
 do {
     let capped = 10801.0          // 顶满上限

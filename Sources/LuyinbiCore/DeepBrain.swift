@@ -341,6 +341,10 @@ public final class DeepBrain {
     public enum DeviceBindOutcome {
         case ok
         case deviceTaken
+        /// 服务端不认这次请求。**单独列出来**：它和"名字被占"要走完全不同的处理——
+        /// 换个名字重试对 401 毫无意义，而调用方原来把两者混成一句"仍冲突"，
+        /// 把 2026-09-08 那次排查引向了错误方向。
+        case unauthorized
         case failed(String)
     }
 
@@ -351,6 +355,7 @@ public final class DeepBrain {
                 headers: { try self.authHeaders },
                 json: ["provider": provider, "deviceNo": deviceNo])
             if st < 400 { return .ok }
+            if st == 401 || st == 403 { return .unauthorized }
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             let code = obj?["error"] as? String
             switch code {

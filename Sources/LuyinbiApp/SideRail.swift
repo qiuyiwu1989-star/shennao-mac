@@ -103,8 +103,20 @@ struct DevicePage: View {
     private var dev: DeviceInfo { model.device }
 
     /// 设备里还没导进来的条数。这是设备页真正要回答的问题。
+    ///
+    /// **不含设备自己报 0 字节的条目。** 2026-09-09：录音笔上有一条 8 月 29 号的
+    /// 空录音，设备在列表里就报着 time=0 size=0。它永远导不进来（没内容可导），
+    /// 于是这里永远显示「等着导入 1 条」——用户看到的是「连上又断、
+    /// 老有一条卡着」，而链路完全正常。
+    /// 一个永远不会变的「待办」不是待办，是噪音。
     private var pendingImport: Int {
-        model.items.filter { $0.deviceSize != nil && $0.localBytes == nil }.count
+        model.items.filter { ($0.deviceSize ?? 0) > 0 && $0.localBytes == nil }.count
+    }
+
+    /// 设备上的空文件条数。单独说，因为它既不是「等着导入」也不是「失败」——
+    /// 是录音笔上本来就没内容的一条，用户唯一能做的是把它删掉。
+    private var emptyOnDevice: Int {
+        model.items.filter { $0.deviceSize == 0 && $0.localBytes == nil }.count
     }
 
     var body: some View {
@@ -155,14 +167,23 @@ struct DevicePage: View {
     private var grid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)],
                   alignment: .leading, spacing: 10) {
-            // 断开之后电量是上次同步的读数，不是现状——所以断开时不摆数字。
-            // 但「—」不该被当成「读不出来」：同步忙起来时本来就不去读这几项
-            // （窗口要留给传输），空闲那一轮才读。所以这里把「还没读到」
-            // 和「设备不在」分开说，别让人以为哪里坏了。
-            stat("电量", dev.connected ? battery : (dev.battery == nil ? idleHint : "—"))
-            stat("容量", capacity)
-            stat("固件", dev.connected ? (dev.firmware ?? "—") : (dev.firmware ?? idleHint))
+            // **这三格跟标题行、图标用同一个判据（present），不能用瞬时的 connected。**
+            //
+            // 2026-09-10 用户连拍两张截图问「这是连着还是断了」：同一秒的下载
+            // 百分比一模一样，电量却一张是「—」、一张是 84%。原因就是这里写的是
+            // `dev.connected ? 真值 : "—"`——而一轮同步里 connected 每十几秒
+            // 翻一次（连上→传→被设备断开→再连），于是这两格一直在闪。
+            // 固件当时反而稳定，因为它两个分支取的是同一个值，正好把 bug 藏住了。
+            //
+            // 原来那句「断开之后是上次同步的读数，不是现状」本身没错，但它说的是
+            // **设备真的不在了**；同步中途那十几秒的空档不属于这种情况。
+            stat("电量", hardware(dev.battery == nil ? nil : battery))
+            stat("容量", hardware(capacityValue))
+            stat("固件", hardware(dev.firmware))
             stat("等着导入", pendingImport == 0 ? "都导完了" : "\(pendingImport) 条")
+            if emptyOnDevice > 0 {
+                stat("设备上的空录音", "\(emptyOnDevice) 条")
+            }
         }
     }
 
@@ -205,10 +226,21 @@ struct DevicePage: View {
     /// 正在搬文件的时候，那十几秒的窗口全都留给传输。
     private var idleHint: String { model.isBusy ? "同步中，稍后读" : "—" }
 
-    private var capacity: String {
-        guard dev.connected, let remain = dev.capacityRemain, let total = dev.capacityTotal,
-              total > 0 else { return "—" }
+    private var capacityValue: String? {
+        guard let remain = dev.capacityRemain, let total = dev.capacityTotal, total > 0 else { return nil }
         return "剩 \(remain / 1024 / 1024)M / 共 \(total / 1024 / 1024)M"
+    }
+
+    /// 一格硬件读数该显示什么。
+    ///
+    /// 三种状态，必须分清楚，否则一个「—」要替三件事背锅：
+    /// - 设备在（连着，或正在这一轮里跟它打交道）且读到了 → 摆数字，
+    ///   **中途断开的那十几秒也照样摆**，它十秒前才读的，不算过期；
+    /// - 设备在但还没读到 → 说清楚在等什么（忙的时候本来就不读，窗口留给传输）；
+    /// - 设备真的不在 → 「—」。这时候上次的读数确实不能代表现状。
+    private func hardware(_ value: String?) -> String {
+        guard working || dev.connected else { return "—" }
+        return value ?? idleHint
     }
 
     private func stat(_ label: String, _ value: String) -> some View {

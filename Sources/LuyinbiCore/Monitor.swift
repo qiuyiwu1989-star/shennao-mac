@@ -274,6 +274,16 @@ public enum SyncPlanner {
                                localRaw: [String: Int] = [:]) -> [FileEntry] {
         entries.filter { e in
             guard manifest.imported[manifestKey(e)] == nil else { return false }
+            // 设备**在列表里就报了 0 字节**——这条不用试，一次都不用。
+            //
+            // 2026-09-09：`note20260829-190137.` 就是这样一条（录音笔上的一次
+            // 空录音）。老代码照常下载它，每次回 0 字节记一次失败，攒够 5 次放弃，
+            // 然后**永远留在「等着导入 1 条」里**——用户看到的是「连上又断、
+            // 一直有一条导不进来」，而链路其实好好的。
+            //
+            // 关键在于这不是「下载失败」，是「设备说它是空的」：判据在列表阶段
+            // 就已经拿到了，花任何一次连接时间去试都是白花。
+            guard e.size > 0 else { return false }
             guard !isLive(e, status: status, current: current) else { return false }
             if let have = localRaw[normalizedBase(e.name)],
                have == Int(e.size), have % 40 == 0, have > 0 { return false }
@@ -299,6 +309,13 @@ public enum SyncPlanner {
         guard let savedFor, savedFor == announced else { return false }
         guard bytes > 0, bytes < Int(announced) else { return false }   // 空的没用；够了就不叫断点
         return bytes % 40 == 0                                          // 必须停在整包边界
+    }
+
+    /// 设备自己报 0 字节的条目。**不是失败，是设备上本来就没内容**——
+    /// 界面要把它跟「等着导入」分开说，否则一条永远导不进来的空文件
+    /// 会让整个同步看起来是坏的。
+    public static func emptyOnDevice(entries: [FileEntry]) -> [FileEntry] {
+        entries.filter { $0.size == 0 }
     }
 
     /// 攒够次数、已经被自动重试放弃的条目。界面据此显示「试了 N 次都没成，点这里再试」。
@@ -899,17 +916,22 @@ public final class SyncEngine: ObservableObject {
         // 到底是已记账、还是被当成正在录、还是攒够失败次数被放弃了，
         // 从日志里一个字都看不出来，只能对着代码反推。这几行就是补这个。
         if todo.isEmpty && !entries.isEmpty {
-            var already = 0, live = 0, gaveUp = 0, haveLocal = 0
+            var already = 0, empty = 0, live = 0, gaveUp = 0, haveLocal = 0
             for e in entries {
                 let key = SyncPlanner.manifestKey(e)
                 if manifest.imported[key] != nil { already += 1 }
+                // 空文件排在失败之前判：这两种在老日志里长得一模一样，
+                // 而它们该走的路完全相反——空文件永远不该再试，
+                // 失败的条目手动点一下还有机会。
+                else if e.size == 0 { empty += 1 }
                 else if SyncPlanner.isLive(e, status: lastStatus, current: lastCurrent) { live += 1 }
                 else if (manifest.downloadFailures[key] ?? 0) >= SyncPlanner.giveUpAfter { gaveUp += 1 }
                 else if let have = rawOnDisk[SyncPlanner.normalizedBase(e.name)],
                         have == Int(e.size), have % 40 == 0, have > 0 { haveLocal += 1 }
             }
-            log.write("这一轮没有要下的：已记账 \(already) / 正在录 \(live)"
-                      + " / 试够次数放弃 \(gaveUp) / 本地已有完整副本 \(haveLocal)")
+            log.write("这一轮没有要下的：已记账 \(already) / 设备上是空文件 \(empty)"
+                      + " / 正在录 \(live) / 试够次数放弃 \(gaveUp)"
+                      + " / 本地已有完整副本 \(haveLocal)")
         } else if !todo.isEmpty {
             log.write("要下 \(todo.count) 条："
                       + todo.prefix(5).map { SyncPlanner.normalizedBase($0.name) }.joined(separator: "、")
@@ -1191,16 +1213,47 @@ public final class SyncEngine: ObservableObject {
     /// 一项都不参与「要不要下载」的判断，所以放到干完活之后再读——
     /// 断线了就这一轮不更新，界面上还是上次的读数，没有任何损失。
     private func readDisplayInfo(_ client: BLEClient) async {
+        // **读不到就保留上一次读到的值，不要抹成 nil。**
+        //
+        // 2026-09-09：设备页上电量和容量长期是「—」，而固件有值。老代码是
+        // `device.battery = (try? …) ?? nil`——这一句无论成败都会赋值，
+        // 于是任何一次读失败都会把上一次读到的好值擦掉。四项里只要有一项
+        // 时好时坏，它在界面上就永远是空的。
+        //
+        // 而且四个读取全都被 `try?` 吞掉，**失败没有任何痕迹**：
+        // 日志、界面、错误计数一个字都没有，只能靠盯着一个空格子猜。
+        // 「读不到 ≠ 没问题」——丢弃路径必须留痕，否则「设备没答」和
+        // 「我们没接住」永远分不开。
+        var missed: [String] = []
+
         guard client.isConnected else { return }
-        device.battery = (try? await client.battery()) ?? nil
-        checkBattery(device.battery)
-        guard client.isConnected else { return }
-        device.firmware = (try? await client.firmware()) ?? nil
-        device.gain = (try? await client.gain()) ?? nil
+        if let v = (try? await client.battery()) ?? nil {
+            device.battery = v
+            checkBattery(v)
+        } else { missed.append("电量") }
+
+        guard client.isConnected else { logMissed(missed); return }
+        if let v = (try? await client.firmware()) ?? nil { device.firmware = v }
+        else { missed.append("固件") }
+
+        guard client.isConnected else { logMissed(missed); return }
+        if let v = (try? await client.gain()) ?? nil { device.gain = v }
+        else { missed.append("增益") }
+
+        guard client.isConnected else { logMissed(missed); return }
         if let cap = (try? await client.capacity()) ?? nil {
             device.capacityRemain = cap.remain
             device.capacityTotal = cap.total
-        }
+        } else { missed.append("容量") }
+
+        logMissed(missed)
+    }
+
+    /// 硬件读数没读到的话留一行。这几项都不参与判断，所以**不当错误报给用户**，
+    /// 但也不能一声不吭——日志里有这一行，下次才不用对着一个空格子反推。
+    private func logMissed(_ missed: [String]) {
+        guard !missed.isEmpty else { return }
+        log.write("设备读数没答：\(missed.joined(separator: "、"))（不影响同步）")
     }
 
     // MARK: - 待推队列

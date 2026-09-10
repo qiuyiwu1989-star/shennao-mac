@@ -176,6 +176,29 @@ do {
           SyncPlanner.unrecorded(entries: [zero], manifest: empty, status: nil, current: nil,
                                  localRaw: ["z": 0], localOgg: ["z"]).count, 0)
 
+    // ── 设备自己报 0 字节：一次都不试 ────────────────────────────────
+    // 2026-09-09 真实条目 `note20260829-190137.`：录音笔上的一次空录音，
+    // 列表里就写着 time=0 size=0。老代码照常下载它、每次回 0 字节记一次失败，
+    // 攒够 5 次放弃，然后永远留在设备页的「等着导入 1 条」里——
+    // 用户看到的是「连上又断、老有一条卡着」，而链路完全正常。
+    // 判据在列表阶段就拿到了，花任何一次连接时间去试都是白花。
+    do {
+        let 空 = FileEntry(time: 0, size: 0, name: "note20260829-190137.",
+                          rawName: Array("note20260829-190137.".utf8))
+        check("设备报 0 字节 → 不进待下队列",
+              SyncPlanner.pending(entries: [空], manifest: SyncManifest(),
+                                  status: nil, current: nil, localRaw: [:]).count, 0)
+        check("设备报 0 字节 → 单独列为空文件",
+              SyncPlanner.emptyOnDevice(entries: [空]).count, 1)
+        check("正常条目不会被当成空文件",
+              SyncPlanner.emptyOnDevice(entries: [e]).count, 0)
+
+        // 关键：空文件不该被算成「放弃」。两者在老日志里长得一样，
+        // 但该走的路相反——空文件永远不该再试，放弃的手动点一下还有机会。
+        check("空文件没有失败记录，不算已放弃",
+              SyncPlanner.givenUp(entries: [空], manifest: SyncManifest()).count, 0)
+    }
+
     // ── 僵尸条目：连续失败够多次就不再自动重试 ─────────────────────────
     // 实测过一条设备报着、一下就回 0 字节的文件，9 天里被自动重试了 97 次，
     // 每次都占掉一段 27KB/s 的连接时间。判据是「连续」失败，成功一次就清零。

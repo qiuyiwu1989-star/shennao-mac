@@ -37,6 +37,8 @@ struct AppActions {
     /// 账号不匹配警告里点了「继续」：换个名字重新绑给当前账号（spec 019）。
     /// 返回 false 表示绑定没成功（多半是名字又撞了），界面留在原地让人换个名字重试。
     var resolveBindMismatch: @MainActor (String) async -> Bool = { _ in false }
+    /// 给当前连着的这支笔改名。返回 nil 表示成功，否则是给人看的失败原因。
+    var renameDevice: @MainActor (String) async -> String? = { _ in "未接线" }
     /// 账号不匹配警告里点了「取消」：这支笔这次不同步，警告卡片消失。
     var dismissBindMismatch: @MainActor () -> Void = {}
     /// 真去验一次会话还能不能用（不是只看本地存没存过 token）。

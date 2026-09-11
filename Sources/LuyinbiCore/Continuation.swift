@@ -81,3 +81,57 @@ public enum Continuation {
         return parts.flatMap { $0 }
     }
 }
+
+// MARK: - 录音时刻的现场证据
+
+/// 「这条录音真正开始于什么时候」的现场证据。
+///
+/// **为什么需要它。** 录音时刻现在完全取自文件名，而文件名是笔用自己的
+/// RTC 写的。2026-09-11 实测：一条今天下午录的会议被命名成
+/// `note20260217-085152`，带着错了 206 天的日期进了深脑的 started_at
+/// ——深脑整套按证据时间轴立，这种错比没有日期更伤。
+///
+/// 而破案靠的东西，客户端当时就握在手里：同步日志里
+/// 「15:08 那次列表没在录 / 15:18 那次正在录」。
+/// **真实开始必然夹在这两个时刻之间**，跟笔的时钟准不准完全无关。
+/// 这个结构就是把这份证据留下来，别再扔掉。
+public struct LiveWitness: Codable, Equatable, Sendable {
+    /// 最后一次确认设备**没在录**的时刻。真实开始必然晚于它。
+    public var notRecordingAt: Date?
+    /// 第一次看到设备**正在录这一条**的时刻。真实开始必然早于它。
+    public var firstSeenLiveAt: Date
+    public init(notRecordingAt: Date?, firstSeenLiveAt: Date) {
+        self.notRecordingAt = notRecordingAt; self.firstSeenLiveAt = firstSeenLiveAt
+    }
+}
+
+extension Continuation {
+    /// 送给深脑的录音时刻：优先信文件名，信不过就用现场证据夹出来的窗口中点。
+    ///
+    /// 窗口下界取两者中**更晚**的那个：
+    ///   · 最后一次确认「没在录」——它之后才可能开始；
+    ///   · 第一次看到「正在录」减去总时长——再早就录不完这么长。
+    /// 上界就是第一次看到「正在录」的时刻。
+    ///
+    /// 文件名落在窗口里（留一点容差）就照用——笔的时钟准的时候本该如此，
+    /// 而且文件名比窗口中点精确。落在窗口外很远，就是笔的时钟不对，改用中点。
+    ///
+    /// - Returns: `corrected` 为 true 表示文件名被判定不可信、这里换了值。
+    ///   调用方要把这件事写进日志——**静默改掉一个时间戳比用错的更糟**。
+    public static func trueStart(base: String, witness: LiveWitness?, durationSec: Double,
+                                 tolerance: TimeInterval = 1800)
+    -> (at: Date?, corrected: Bool) {
+        let fromName = startedAt(base: base)
+        guard let w = witness else { return (fromName, false) }
+        let hi = w.firstSeenLiveAt
+        let byDuration = hi.addingTimeInterval(-max(0, durationSec))
+        let lo = max(w.notRecordingAt ?? byDuration, byDuration)
+        guard lo <= hi else { return (fromName, false) }      // 证据自相矛盾就不动
+        if let n = fromName,
+           n >= lo.addingTimeInterval(-tolerance), n <= hi.addingTimeInterval(tolerance) {
+            return (n, false)
+        }
+        return (Date(timeIntervalSince1970:
+                     (lo.timeIntervalSince1970 + hi.timeIntervalSince1970) / 2), true)
+    }
+}

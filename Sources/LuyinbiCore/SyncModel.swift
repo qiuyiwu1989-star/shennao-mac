@@ -62,6 +62,11 @@ public struct DeviceInfo: Sendable {
     public var recordStatus: UInt8?      // 1录音中 2未录音 3暂停
     public var capacityRemain: UInt32?
     public var capacityTotal: UInt32?
+    /// 这支笔在深脑里登记的名字。**每支笔各不相同**——
+    /// name 是型号（所有 CB08 都叫 CB08），认不出是哪一支。
+    public var bindingName: String?
+    /// 本机给这支笔的标识（CoreBluetooth peripheral UUID）。改名要用它定位。
+    public var peripheralId: String?
     public init() {}
 }
 

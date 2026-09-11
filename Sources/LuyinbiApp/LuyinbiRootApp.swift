@@ -41,6 +41,10 @@ final class AppState {
             return await DeepBrain.checkSession(config: cfg)
         }
         model.actions.resolveBindMismatch = { [engine] name in await engine.resolveBindMismatch(newDeviceName: name) }
+        model.actions.renameDevice = { [engine] name in
+            let r = await engine.renameDevice(to: name)
+            return r.ok ? nil : r.why
+        }
         model.actions.dismissBindMismatch = { [engine] in engine.dismissBindMismatch() }
         model.cleanupEnabled = engine.cleanup.deleteAfterSync
         model.coolingDays = engine.cleanup.coolingDays

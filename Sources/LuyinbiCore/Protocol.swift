@@ -77,6 +77,30 @@ public enum Proto {
         return [magic, seq, UInt8(crc & 0xFF), UInt8(crc >> 8)] + lenBytes + data
     }
 
+    /// 0-0 同步时间。**App→Dev，没有应答。**
+    ///
+    /// 厂商命令表第一条，而我们一直没实现——于是从来没给笔校过时。
+    /// 代价 2026-09-11 才显形：一支笔上的录音被命名成 `note20260217-085152`，
+    /// 而转写内容里有人说「今年的 5 月份去他办公室」——2 月录不出这句话。
+    /// 那条录音带着错了大半年的时间进了深脑的 `started_at`。
+    /// 深脑整套是按证据时间轴立的，错的日期比没有日期更伤。
+    ///
+    /// 载荷 7 字节：year 2B 小端 + month/day/hour/minute/second 各 1B。
+    /// 用**本地时间**——笔给文件命名用的就是本地时间
+    /// （note20260217-085152 对应深脑里的 00:51:52+00，正好是 +08 的 08:51:52）。
+    public static func buildSetTime(_ comps: (year: Int, month: Int, day: Int,
+                                              hour: Int, minute: Int, second: Int),
+                                    seq: UInt8 = 0) -> [UInt8] {
+        let y = UInt16(clamping: comps.year)
+        let params: [UInt8] = [
+            UInt8(y & 0xFF), UInt8(y >> 8),
+            UInt8(clamping: comps.month), UInt8(clamping: comps.day),
+            UInt8(clamping: comps.hour), UInt8(clamping: comps.minute),
+            UInt8(clamping: comps.second),
+        ]
+        return buildFrame(T.ctrl, 0, params, seq: seq)
+    }
+
     public static func buildImportRequest(_ filename: String, offset: UInt32 = 0,
                                           seq: UInt8 = 0) throws -> [UInt8] {
         let params = try le32(offset) + paddedName(filename)

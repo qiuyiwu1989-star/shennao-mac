@@ -30,6 +30,9 @@ public struct SyncPaths: Sendable {
     public var rawPackets: URL { dest.appendingPathComponent("原始包") }
     public var manifest: URL { dest.appendingPathComponent("manifest.json") }
     public var deepBrainConfig: URL { root.appendingPathComponent("importer/deepbrain.json") }
+    /// 录音时刻的现场证据。**单独一个文件**，不塞进 manifest.json——
+    /// 那份是跟 Python 版共用的，格式不能动。
+    public var witnesses: URL { dest.appendingPathComponent("录音时刻证据.json") }
 
     public func ensureDirs() throws {
         try FileManager.default.createDirectory(at: rawPackets, withIntermediateDirectories: true)
@@ -589,6 +592,13 @@ public final class SyncEngine: ObservableObject {
     /// base → 深脑会话状态，只活在内存里（Python 版清单没有这两个字段，不往里加）
     private var brainState: [String: (status: String, transcript: String?, error: String?)] = [:]
     private var lastEntries: [FileEntry] = []
+    /// 本进程内是否已经校过时。校时每次连接都发（便宜、且笔可能中途掉电），
+    /// 但日志只写第一次——不然每 60 秒一行，真正要看的会被淹掉。
+    private var didSyncClock = false
+    /// 最后一次确认设备「没在录」的时刻。新录音一冒头，它就是那条录音的时间下界。
+    private var lastNotRecordingAt: Date?
+    /// base → 现场证据。跨进程留存：一场两小时的会中间可能重启 App。
+    private var witnesses: [String: LiveWitness] = [:]
     private var lastStatus: UInt8?
     private var lastCurrent: String?
 
@@ -617,6 +627,7 @@ public final class SyncEngine: ObservableObject {
 
     public func start() {
         loadCleanupSettingsOnce()
+        loadWitnesses()
         recoverStrandedRecordings()
         startBrainPolling()
         startUploadRetry()
@@ -831,6 +842,36 @@ public final class SyncEngine: ObservableObject {
         // 顺序就是优先级：先拿到能不能下载的判据，再拉列表干活，
         // 显示用的读数留到最后（见 readSyncCriticalInfo 的注释）。
         await readSyncCriticalInfo(client)
+
+        // **把「此刻它在不在录」记下来。**
+        //
+        // 这一条是 2026-09-11 那次破案的全部依据：日志里 15:08 那次列表
+        // 「没在录」、15:18 那次「正在录」，真实开始必然夹在中间——
+        // 跟笔的时钟准不准毫无关系。当时这份证据客户端就握着，却扔掉了，
+        // 于是一条今天下午的会带着 2 月 17 号的日期进了深脑。
+        noteLiveObservation()
+
+        // **每次连上都校一次时。**
+        //
+        // 笔给文件起的名字就是它自己的时钟（note20260911-085152），而这个
+        // 时间会被原样当成录音时刻送进深脑的 started_at。笔掉电之后 RTC 会漂，
+        // 于是 2026-09-11 撞上这一幕：一条录音被命名成 note20260217-085152，
+        // 而它的转写里有人说「今年的 5 月份去他办公室」——2 月录不出这句话。
+        // 那条录音带着错了大半年的日期进了深脑。
+        //
+        // 厂商命令表第一条就是 0-0 同步时间，我们一直没实现。
+        // 一帧、无应答、不等回复，放在连接窗口里的代价可以忽略。
+        //
+        // 只在**没在录音**时发：录音进行中改设备时钟，那条正在录的文件
+        // 会拿到什么名字、时长怎么算，都没有依据可循。
+        if lastStatus != 1 && lastStatus != 3 {
+            do {
+                try client.setTime()
+                if !didSyncClock { log.write("已给录音笔校时"); didSyncClock = true }
+            } catch {
+                log.write("校时没发出去：\(describe(error))（不影响这一轮同步）")
+            }
+        }
 
         phase = .listing
         let entries: [FileEntry]
@@ -1190,6 +1231,46 @@ public final class SyncEngine: ObservableObject {
     ///
     /// `currentFilename` 只在设备自称在录时才问：它**没在录的时候本来就没有
     /// 「当前文件」**，白问一次要干等 4 秒超时——正是那 8 秒里最大的一笔浪费。
+    /// 这条录音送给深脑的时刻。
+    ///
+    /// **纠正必须留痕。** 静默改掉一个时间戳比用错的更糟——用错的还能被发现，
+    /// 悄悄改过的看起来永远是对的，而深脑整套是按证据时间轴立的。
+    private func trueStart(base: String, durationSec: Double) -> Date? {
+        let r = Continuation.trueStart(base: base, witness: witnesses[base], durationSec: durationSec)
+        if r.corrected, let at = r.at {
+            log.write("\(base) 的文件名时刻跟现场证据对不上（笔的时钟不准），"
+                      + "改按证据推定为 \(Self.stamp(at))")
+        }
+        return r.at
+    }
+
+    /// 记录「此刻设备在不在录音」。见 LiveWitness 的注释。
+    private func noteLiveObservation() {
+        let now = Date()
+        guard lastStatus == 1 || lastStatus == 3, let live = lastCurrent, !live.isEmpty else {
+            // 明确没在录：给下一条还没出现的录音留一个时间下界。
+            if lastStatus == 2 { lastNotRecordingAt = now }
+            return
+        }
+        let base = SyncPlanner.normalizedBase(live)
+        guard witnesses[base] == nil else { return }        // 只记第一次看见
+        witnesses[base] = LiveWitness(notRecordingAt: lastNotRecordingAt, firstSeenLiveAt: now)
+        saveWitnesses()
+        log.write("记下现场证据：\(base) 此刻正在录"
+                  + (lastNotRecordingAt.map { "，而 \(Self.stamp($0)) 那次还没在录" } ?? ""))
+    }
+
+    private func loadWitnesses() {
+        guard let d = try? Data(contentsOf: paths.witnesses),
+              let w = try? JSONDecoder().decode([String: LiveWitness].self, from: d) else { return }
+        witnesses = w
+    }
+
+    private func saveWitnesses() {
+        guard let d = try? JSONEncoder().encode(witnesses) else { return }
+        try? d.write(to: paths.witnesses, options: .atomic)
+    }
+
     private func readSyncCriticalInfo(_ client: BLEClient) async {
         device.recordStatus = (try? await client.recordStatus()) ?? nil
         lastStatus = device.recordStatus
@@ -1244,6 +1325,21 @@ public final class SyncEngine: ObservableObject {
         if let cap = (try? await client.capacity()) ?? nil {
             device.capacityRemain = cap.remain
             device.capacityTotal = cap.total
+            // **把原始值和当前列表的实际占用一起记下来，用来标定单位。**
+            //
+            // 容量这两个数的单位至今没有定论：厂商文档标 8KB/格，早期实测觉得
+            // 更接近 64B，协议层因此拒绝替设备做换算（见 Commands.capacity）。
+            // 但界面那边一直当字节除了两次 1024，于是显示成「剩 28M / 共 29M」——
+            // 而笔上单个文件就有 20.6MB，两个数字自己打架（2026-09-11 用户发现）。
+            //
+            // 单位 = (总 − 剩) × unit ≈ 列表里所有文件的字节和。
+            // 这一行把等式两边同时记下来，攒够几次就能把 unit 算死，
+            // 不用再猜，也不用再信文档。
+            let used = cap.total >= cap.remain ? cap.total - cap.remain : 0
+            let listed = lastEntries.reduce(0) { $0 + UInt64($1.size) }
+            log.write("容量原始值：总 \(cap.total) 剩 \(cap.remain) 已用 \(used) 格"
+                      + "；此刻列表 \(lastEntries.count) 条合计 \(listed) B"
+                      + (used > 0 ? "；推算一格 ≈ \(listed / UInt64(used)) B" : ""))
         } else { missed.append("容量") }
 
         logMissed(missed)
@@ -1422,7 +1518,7 @@ public final class SyncEngine: ObservableObject {
                         + (mergedBases.count > 1 ? "-merged\(mergedBases.count)" : ""),
                     mime: ext == "m4a" ? "audio/mp4" : "audio/ogg",
                     // 真实录音时刻，不是上传时刻
-                    startedAt: Continuation.startedAt(base: base),
+                    startedAt: trueStart(base: base, durationSec: duration),
                     projectId: manifest.plan[base]?.projectId,
                     onStep: { [weak self] step in
                         Task { @MainActor in self?.phase = .uploading(base, step) }
@@ -1751,7 +1847,11 @@ public final class SyncEngine: ObservableObject {
         }
 
         if let bound = DeviceBinding.binding(for: peripheralId) {
-            if bound.orgId == currentOrg { return true }
+            if bound.orgId == currentOrg {
+                device.bindingName = bound.deviceNo
+                device.peripheralId = peripheralId
+                return true
+            }
             pendingBindMismatch = BindMismatch(
                 peripheralId: peripheralId, deviceName: target.name,
                 previousEmail: bound.email, currentEmail: currentEmail)
@@ -1775,13 +1875,24 @@ public final class SyncEngine: ObservableObject {
             log.write("首次绑定「\(target.name)」暂时跳过：深脑接不通（登录可能失效了），本轮先同步，下次连接再试绑定")
             return true
         }
-        // `Host.current().localizedName` 实测返回「qiu的MacBook Air」——**带空格**，
-        // 而服务端的 isValidDeviceNo 不收空格，于是每次都被判 device_no_invalid。
-        // 写这段时我没有实际看过它返回什么，是想当然（2026-09-08 实测才发现）。
-        let defaultName = SyncPlanner.safeDeviceNo("\(target.name)-\(Host.current().localizedName ?? "Mac")")
+        // **默认名必须每支笔各不相同。**
+        //
+        // 2026-09-11 实测：原来的默认名是「型号-这台 Mac 的名字」，两半都不认笔——
+        // `CB08` 是型号，所有 CB08 都这么报；后半截是**你的电脑**。
+        // 于是同一台 Mac 上的第二支笔算出完全一样的 device_no，撞上
+        // `(provider, device_no)` 全局唯一之后服务端复用了第一支的那一行，
+        // 还回了 ok。本机记着三支笔，深脑里只有一行，而日志每次都写「绑定成功」。
+        //
+        // 补一段本机 peripheral UUID 的前缀就够了：它按笔生成，稳定且各不相同。
+        // 这只是个能区分开的默认值——真正好认的名字（「随身那支」）由用户自己改。
+        let mark = String(peripheralId.replacingOccurrences(of: "-", with: "").prefix(6))
+        let defaultName = SyncPlanner.safeDeviceNo(
+            "\(target.name)-\(Host.current().localizedName ?? "Mac")-\(mark)")
         let first = await bindDevice(peripheralId, orgId: currentOrg, email: currentEmail,
                                      deviceNo: defaultName, brain: brain)
         if first.ok {
+            device.bindingName = defaultName
+            device.peripheralId = peripheralId
             log.write("首次绑定「\(target.name)」到当前账号「\(currentEmail)」，命名为「\(defaultName)」")
             return true
         }
@@ -1844,6 +1955,38 @@ public final class SyncEngine: ObservableObject {
         pendingBindMismatch = nil
         if isFailed(phase) { phase = .waitingForDevice }
         return true
+    }
+
+    /// 界面调用：给这支笔改个名字。
+    ///
+    /// **深脑那边是「用新名字再登记一次」，不是原地改名。**
+    /// `(provider, device_no)` 是全局唯一键，服务端没有改名这个动作；
+    /// 所以旧的那一行会留在原地不再被用到。这是可以接受的代价——
+    /// 换来的是「这支笔到底是哪一支」第一次真的能回答。
+    ///
+    /// 为什么需要这个：默认名是机器拼的（型号 + 电脑名 + 一段 UUID），
+    /// 能区分开，但你认不出来。「客厅那支 / 随身那支」才是有用的名字，
+    /// 而这种名字只有你能起。
+    public func renameDevice(to raw: String) async -> (ok: Bool, why: String) {
+        guard let peripheralId = device.peripheralId else {
+            return (false, "还没连上这支笔，连上之后才能改名")
+        }
+        let name = SyncPlanner.safeDeviceNo(raw.trimmingCharacters(in: .whitespaces))
+        guard !name.isEmpty else { return (false, "名字不能是空的") }
+        guard name != device.bindingName else { return (true, "") }
+        guard let brain = await ensureBrain() else {
+            return (false, "连不上深脑，改名要登记到服务端才算数")
+        }
+        let r = await bindDevice(peripheralId, orgId: brain.org ?? "",
+                                 email: DeepBrain.signedInEmail ?? "当前账号",
+                                 deviceNo: name, brain: brain)
+        guard r.ok else {
+            log.write("改名失败「\(device.bindingName ?? "?")」→「\(name)」：\(r.why)")
+            return (false, r.why)
+        }
+        log.write("改名「\(device.bindingName ?? "?")」→「\(name)」")
+        device.bindingName = name
+        return (true, "")
     }
 
     /// 界面调用：账号不匹配警告里用户点了「取消」——保持原样，这支笔这次不同步。

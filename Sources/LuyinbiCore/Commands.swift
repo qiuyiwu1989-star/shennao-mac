@@ -8,6 +8,19 @@ public extension BLEClient {
         return await expect(Proto.T.ctrl, 4, timeout: timeout)?.body.first
     }
 
+    /// 给笔校时。没有应答，所以只管发出去。
+    ///
+    /// **只在笔没在录音时发。** 录音进行中改设备时钟，那条正在录的文件
+    /// 会拿到什么名字、时长怎么算，都没有依据可循——不冒这个险。
+    func setTime(_ now: Date = Date()) throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: now)
+        try sendRaw(Proto.buildSetTime(
+            (c.year ?? 2026, c.month ?? 1, c.day ?? 1, c.hour ?? 0, c.minute ?? 0, c.second ?? 0),
+            seq: nextSeq()))
+    }
+
     func firmware(timeout: TimeInterval = 4) async throws -> String? {
         try send(Proto.T.ctrl, 10)
         guard let b = await expect(Proto.T.ctrl, 11, timeout: timeout)?.body else { return nil }

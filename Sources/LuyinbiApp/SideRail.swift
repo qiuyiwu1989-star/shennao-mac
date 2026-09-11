@@ -102,6 +102,14 @@ struct DevicePage: View {
 
     private var dev: DeviceInfo { model.device }
 
+    /// 点笔上某一条 → 跳到「内容」里那一条。
+    /// 没有这个出口的话，设备页只能告诉你「已导入」，却不能带你去看。
+    var onOpen: (String) -> Void = { _ in }
+
+    @State private var draftName = ""
+    @State private var renaming = false
+    @State private var renameNote: String?
+
     /// 设备里还没导进来的条数。这是设备页真正要回答的问题。
     ///
     /// **不含设备自己报 0 字节的条目。** 2026-09-09：录音笔上有一条 8 月 29 号的
@@ -125,6 +133,8 @@ struct DevicePage: View {
                 if let m = model.pendingBindMismatch { bindMismatchCard(m) }
                 header
                 grid
+                identity
+                onDevice
                 rules
                 archive
             }
@@ -142,6 +152,135 @@ struct DevicePage: View {
         BindMismatchCard(mismatch: m, scheme: scheme,
             onConfirm: { name in await model.actions.resolveBindMismatch(name) },
             onCancel: { model.actions.dismissBindMismatch() })
+    }
+
+    // MARK: - 这支笔叫什么
+
+    /// **型号名认不出是哪一支。** 所有 CB08 都报「CB08」，
+    /// 而 2026-09-11 实测本机已经见过三支笔——它们在深脑里共用了同一行记录，
+    /// 因为默认名是「型号 + 这台 Mac 的名字」拼的，两半都不认笔。
+    /// 现在默认名带上本机标识所以至少分得开，但分得开不等于认得出：
+    /// 「客厅那支 / 随身那支」这种名字只有你能起。
+    @ViewBuilder
+    private var identity: some View {
+        if dev.bindingName != nil || dev.peripheralId != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("这支笔").font(DS.bodyFont(DS.T.body, .semibold))
+                    .foregroundStyle(DS.title(scheme == .dark))
+                Text("深脑里按这个名字记账。型号名所有 CB08 都一样，认不出是哪一支。")
+                    .font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    TextField("给它起个名字", text: $draftName)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 260)
+                        .onSubmit { commitRename() }
+                    Button("改名") { commitRename() }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .disabled(renaming || draftName.trimmingCharacters(in: .whitespaces).isEmpty
+                                  || draftName == dev.bindingName)
+                    if renaming { ProgressView().controlSize(.small) }
+                }
+                if let note = renameNote {
+                    Text(note).font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.warn)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(14)
+            .background(DS.surface(scheme == .dark))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .onAppear { if draftName.isEmpty { draftName = dev.bindingName ?? "" } }
+            .onChange(of: dev.bindingName) { n in draftName = n ?? "" }
+        }
+    }
+
+    private func commitRename() {
+        let want = draftName
+        guard !renaming, !want.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        renaming = true; renameNote = nil
+        Task {
+            let err = await model.actions.renameDevice(want)
+            renaming = false
+            renameNote = err
+        }
+    }
+
+    // MARK: - 笔上有什么
+
+    /// 笔上的文件清单。
+    ///
+    /// 2026-09-11 用户问「点进设备能不能看里面有哪些文件」——数据其实一直都在，
+    /// 每一轮同步都会把完整列表读回来，只是界面只给了一个数字。
+    ///
+    /// **必须标明这是上次连接时的快照。** 笔不在的时候这份清单就是旧的，
+    /// 不写读取时间就又变成「界面说着一个它并不掌握的当下状态」——
+    /// 跟「未连接」那一次是同一类错。
+    @ViewBuilder
+    private var onDevice: some View {
+        let files = model.items.filter { $0.deviceSize != nil }
+            .sorted { $0.base > $1.base }
+        if !files.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("笔上的文件").font(DS.bodyFont(DS.T.body, .semibold))
+                        .foregroundStyle(DS.title(scheme == .dark))
+                    Text("\(files.count) 条").font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.muted)
+                    Spacer()
+                    Text(snapshotAge).font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.muted)
+                }
+                .padding(.horizontal, 14).padding(.top, 14).padding(.bottom, 10)
+
+                ForEach(files) { f in
+                    Divider().opacity(0.5)
+                    let openable = f.localBytes != nil
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(f.brainTitle ?? f.base).font(DS.bodyFont(DS.T.meta))
+                                .foregroundStyle(DS.title(scheme == .dark)).lineLimit(1)
+                            Text(deviceLine(f)).font(DS.bodyFont(DS.T.meta))
+                                .foregroundStyle(DS.muted)
+                        }
+                        Spacer(minLength: 8)
+                        StatusPill(text: deviceState(f).0, tone: deviceState(f).1)
+                        // 已经导进来的才有地方可去。
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(DS.muted)
+                            .opacity(openable ? 1 : 0)
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if openable { onOpen(f.base) } }
+                    .help(openable ? "在「内容」里打开这一条" : "还没导进来")
+                }
+            }
+            .background(DS.surface(scheme == .dark))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var snapshotAge: String {
+        guard let t = model.lastRun else { return "还没读过" }
+        let sec = Int(Date().timeIntervalSince(t))
+        if working { return "正在读" }
+        if sec < 90 { return "刚读的" }
+        if sec < 3600 { return "\(sec / 60) 分钟前读的" }
+        return "\(sec / 3600) 小时前读的"
+    }
+
+    private func deviceLine(_ f: RecordingItem) -> String {
+        var parts: [String] = []
+        if f.durationSec > 0 { parts.append(Fmt.duration(f.durationSec)) }
+        if let b = f.deviceSize, b > 0 { parts.append(String(format: "%.1f MB", Double(b) / 1_048_576)) }
+        return parts.isEmpty ? "空文件" : parts.joined(separator: "　")
+    }
+
+    /// 每一条在笔上的状态。**空文件单独说**——它永远导不进来，
+    /// 混进「等着导入」会让人以为同步坏了（2026-09-11 修）。
+    private func deviceState(_ f: RecordingItem) -> (String, StatusPill.Tone) {
+        if f.deviceSize == 0 { return ("空录音", .warn) }
+        if f.localBytes != nil { return ("已导入", .ok) }
+        return ("等着导入", .idle)
     }
 
     private var header: some View {
@@ -226,9 +365,21 @@ struct DevicePage: View {
     /// 正在搬文件的时候，那十几秒的窗口全都留给传输。
     private var idleHint: String { model.isBusy ? "同步中，稍后读" : "—" }
 
+    /// 剩余空间，**用百分比说**。
+    ///
+    /// 2026-09-11：这里原来写的是 `remain / 1024 / 1024` 加个 M，
+    /// 于是显示成「剩 28M / 共 29M」——而笔上单个文件就有 20.6MB，
+    /// 并且那个数还意味着「三十来条录音只占了 1M」。两个数字自己打架。
+    ///
+    /// 根因是**这两个数的单位不是字节**：厂商文档标 8KB 一格，早期实测觉得
+    /// 更接近 64B，协议层因此明确拒绝替设备换算。界面却擅自当字节用了。
+    ///
+    /// 百分比不需要知道单位就永远成立，而且「还剩多少」本来就是这一格
+    /// 要回答的问题。等日志里的标定攒够、单位定死了，再把绝对值加回来——
+    /// **在那之前，宁可少说一个数，也不摆一个假的。**
     private var capacityValue: String? {
         guard let remain = dev.capacityRemain, let total = dev.capacityTotal, total > 0 else { return nil }
-        return "剩 \(remain / 1024 / 1024)M / 共 \(total / 1024 / 1024)M"
+        return "剩 \(Int((Double(remain) / Double(total) * 100).rounded()))%"
     }
 
     /// 一格硬件读数该显示什么。

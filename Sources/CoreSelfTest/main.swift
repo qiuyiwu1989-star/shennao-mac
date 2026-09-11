@@ -176,6 +176,98 @@ do {
           SyncPlanner.unrecorded(entries: [zero], manifest: empty, status: nil, current: nil,
                                  localRaw: ["z": 0], localOgg: ["z"]).count, 0)
 
+    // ── 录音时刻：文件名信不过时用现场证据 ────────────────────────────
+    // 两条都是 2026-09-11 真实事故的原始数据，直接拿日志里的时刻当输入。
+    // 公式必须重现人工破案的结论，否则这个修复就只是"看起来对"。
+    do {
+        func at(_ s: String) -> Date {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = .current
+            return f.date(from: s)!
+        }
+        func show(_ d: Date?) -> String {
+            guard let d else { return "nil" }
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = .current
+            return f.string(from: d)
+        }
+
+        // 案例一：今天下午录的会，笔把它命名成 2 月 17 号。
+        // 日志：15:08:15 那次「没在录」，15:18:13 那次「正在录」，时长 8436 秒。
+        let w1 = LiveWitness(notRecordingAt: at("2026-09-11 15:08:15"),
+                             firstSeenLiveAt: at("2026-09-11 15:18:13"))
+        let r1 = Continuation.trueStart(base: "note20260217-085152", witness: w1, durationSec: 8436)
+        check("笔的时钟错 206 天 → 判为不可信", r1.corrected, true)
+        check("改用窗口中点 15:13:14", show(r1.at), "2026-09-11 15:13:14")
+
+        // 案例二：9-4 那条，同样的笔。日志：10:27:12 没在录，10:37:08 正在录，5446 秒。
+        let w2 = LiveWitness(notRecordingAt: at("2026-09-04 10:27:12"),
+                             firstSeenLiveAt: at("2026-09-04 10:37:08"))
+        let r2 = Continuation.trueStart(base: "note20260209-064341", witness: w2, durationSec: 5446)
+        check("第二条同样判为不可信", r2.corrected, true)
+        check("改用窗口中点 10:32:10", show(r2.at), "2026-09-04 10:32:10")
+
+        // 时钟准的笔：文件名落在窗口里，**必须原样采用**——
+        // 它比窗口中点精确，不该被一个更粗的估计顶掉。
+        let w3 = LiveWitness(notRecordingAt: at("2026-09-11 15:08:15"),
+                             firstSeenLiveAt: at("2026-09-11 15:18:13"))
+        let r3 = Continuation.trueStart(base: "note20260911-151030", witness: w3, durationSec: 8436)
+        check("文件名落在窗口内 → 不动它", r3.corrected, false)
+        check("原样采用文件名 15:10:30", show(r3.at), "2026-09-11 15:10:30")
+
+        // 没有现场证据（Mac 不在旁边时录的）：只能信文件名，不假装知道。
+        let r4 = Continuation.trueStart(base: "note20260217-085152", witness: nil, durationSec: 8436)
+        check("没有证据 → 不声称纠正", r4.corrected, false)
+        check("没有证据 → 照用文件名", show(r4.at), "2026-02-17 08:51:52")
+
+        // 下界还要被时长约束住：没看到过「没在录」时，也不能算出一个
+        // 早于「第一次看到在录 − 时长」的开始时刻——再早就录不完这么长。
+        let w5 = LiveWitness(notRecordingAt: nil, firstSeenLiveAt: at("2026-09-11 15:18:13"))
+        let r5 = Continuation.trueStart(base: "note20260217-085152", witness: w5, durationSec: 8436)
+        check("没有下界时改用「上界减时长」当下界", r5.corrected, true)
+        check("窗口 12:57:37~15:18:13 的中点", show(r5.at), "2026-09-11 14:07:55")
+
+        // 证据自相矛盾（先看到在录、后又说更早没在录）时宁可不动。
+        let w6 = LiveWitness(notRecordingAt: at("2026-09-11 16:00:00"),
+                             firstSeenLiveAt: at("2026-09-11 15:18:13"))
+        let r6 = Continuation.trueStart(base: "note20260217-085152", witness: w6, durationSec: 8436)
+        check("证据自相矛盾 → 不动", r6.corrected, false)
+    }
+
+    // ── 0-0 同步时间 ────────────────────────────────────────────────
+    // 厂商命令表第一条，我们一直没实现，于是从来没给笔校过时。
+    // 代价：一条录音被命名成 note20260217-085152，而转写里有人说
+    // 「今年的 5 月份去他办公室」——2 月录不出这句话。那个错了大半年的
+    // 日期被原样当成录音时刻写进了深脑的 started_at。
+    //
+    // 这条帧**会改设备的时钟**，发错了比不发更糟，所以逐字节钉死。
+    do {
+        let f = Proto.buildSetTime((year: 2026, month: 9, day: 11,
+                                    hour: 20, minute: 9, second: 12))
+        check("0-0 帧长 = 6 头 + 2 类型命令 + 7 载荷", f.count, 15)
+        check("MAGIC", Int(f[0]), 0x5A)
+        check("LEN 小端低字节 = 9（TYPE+CMD+7）", Int(f[4]), 9)
+        check("LEN 小端高字节", Int(f[5]), 0)
+        check("TYPE = ctrl 0", Int(f[6]), 0)
+        check("CMD = 0", Int(f[7]), 0)
+        // year 2B 小端：2026 = 0x07EA
+        check("year 低字节 0xEA", Int(f[8]), 0xEA)
+        check("year 高字节 0x07", Int(f[9]), 0x07)
+        check("month", Int(f[10]), 9)
+        check("day", Int(f[11]), 11)
+        check("hour", Int(f[12]), 20)
+        check("minute", Int(f[13]), 9)
+        check("second", Int(f[14]), 12)
+        // CRC 覆盖 LEN 两字节 + DATA，跟其他帧同一条规矩
+        let crc = Proto.crc16(Array(f[4..<6]) + Array(f[6...]))
+        check("CRC 低字节对得上", Int(f[2]), Int(crc & 0xFF))
+        check("CRC 高字节对得上", Int(f[3]), Int(crc >> 8))
+    }
+
     // ── 设备自己报 0 字节：一次都不试 ────────────────────────────────
     // 2026-09-09 真实条目 `note20260829-190137.`：录音笔上的一次空录音，
     // 列表里就写着 time=0 size=0。老代码照常下载它、每次回 0 字节记一次失败，

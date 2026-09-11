@@ -69,6 +69,13 @@ struct RecordingListView: View {
                         model.selection = next
                         withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(next, anchor: .center) }
                     }
+                    // 选中项也可能是**别处**改的——比如从「设备」页点一条跳过来。
+                    // 2026-09-11：笔上那条是 2 月录的，而列表按录音时间排，
+                    // 它落在 26 条的最底下。不跟着滚，等于跳过来了却什么都没发生。
+                    .onChange(of: model.selection) { sel in
+                        guard let sel else { return }
+                        withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(sel, anchor: .center) }
+                    }
                 }
             }
         }

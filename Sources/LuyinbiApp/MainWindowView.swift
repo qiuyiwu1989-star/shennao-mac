@@ -57,7 +57,11 @@ struct MainWindowView: View {
                 Divider()
                 switch section {
                 case .library: librarySplit
-                case .device:  DevicePage(model: model)
+                case .device:
+                    DevicePage(model: model, onOpen: { base in
+                        model.selection = base
+                        section = .library
+                    })
                 }
             }
         }

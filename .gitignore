@@ -15,3 +15,6 @@ icon/*.iconset/
 icon/*.icns
 icon/make-icon
 icon/preview-*.png
+# 检查图也是每次打包现生成的派生物。以前被 git 跟踪着，于是每打一次包工作树就脏一次，
+# 2026-09-16 三张带着电视机色彩配置的检查图就这样顺手混进了一个跟图标毫无关系的提交。
+icon/check-*.png

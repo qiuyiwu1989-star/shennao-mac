@@ -29,6 +29,7 @@ final class AppState {
         model.actions.deleteImpact = { [engine] item in engine.deleteImpact(item.base) }
         model.actions.deleteFromDevice = { [engine] item in engine.requestDeviceDelete(item.base) }
         model.actions.toggleStar = { [engine] item in engine.toggleStar(item.base) }
+        model.actions.toggleDismissed = { [engine] item in engine.toggleDismissed(item.base) }
         model.actions.setPlan = { [engine] item, title, pid in
             engine.setPlan(item.base, title: title, projectId: pid)
         }
@@ -70,6 +71,9 @@ final class AppState {
                 model?.signedInEmail = DeepBrain.signedInEmail
                 model?.brain = brain
                 engine.start()
+                // 登录失效期间积压的录音立刻推，不等下一轮定时器。
+                // 2026-09-07 那次修好登录后，积压的 4 条躺了 14 分钟没动。
+                engine.signedInAgain()
                 return nil
             } catch { return "\(error)" }
         }

@@ -176,6 +176,59 @@ do {
           SyncPlanner.unrecorded(entries: [zero], manifest: empty, status: nil, current: nil,
                                  localRaw: ["z": 0], localOgg: ["z"]).count, 0)
 
+    // ── 笔在不在旁边：看广播，不看此刻连没连着 ─────────────────────────
+    // 09-16 一天 59 次「连上看一眼没新录音就断开」，每次界面都跳回「未连接」，
+    // 用户第三次来问「为什么连上马上断」。笔明明醒着、一直在广播。
+    do {
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var d = DeviceInfo()
+        check("从没见过 → 不在旁边", d.isNearby(now: t0), false)
+        d.connected = true
+        check("连着 → 在旁边", d.isNearby(now: t0), true)
+        d.connected = false; d.lastSeenAt = t0
+        check("刚断开、3 秒后 → 仍在旁边（笔要几秒才重新广播）", d.isNearby(now: t0.addingTimeInterval(3)), true)
+        check("45 秒内有广播 → 在旁边", d.isNearby(now: t0.addingTimeInterval(45)), true)
+        check("46 秒没广播也没连着 → 不在旁边", d.isNearby(now: t0.addingTimeInterval(46)), false)
+    }
+
+    // ── 短录音门槛：批量推送没有例外 ───────────────────────────────
+    // 2026-09-14 重新登录那一下，1/7/12 秒三条录音被一起推进深脑——
+    // 批量队列的 force 本意只是「别等重试间隔」，却顺手绕过了时长门槛。
+    // 两条转写失败挂在 Mac 端「失败 2」里消不掉，两条白花了转写。
+    // 判定函数的签名里故意没有 force：这条路上根本不存在「绕过」这个选项。
+    do {
+        check("1 秒 < 300 秒门槛 → 不推", SyncPlanner.tooShortToUpload(duration: 1, floorSeconds: 300), true)
+        check("12 秒 → 不推", SyncPlanner.tooShortToUpload(duration: 12, floorSeconds: 300), true)
+        check("恰好 300 秒 → 推", SyncPlanner.tooShortToUpload(duration: 300, floorSeconds: 300), false)
+        check("30 分钟 → 推", SyncPlanner.tooShortToUpload(duration: 1834, floorSeconds: 300), false)
+        check("门槛设为 0 = 关闭 → 都推", SyncPlanner.tooShortToUpload(duration: 1, floorSeconds: 0), false)
+    }
+
+    // ── 「没有人声」不是故障 ───────────────────────────────────────
+    // 截图里一条 1 秒录音标红「转写失败」，还给了「重新推送」按钮——
+    // 对一段静音，推一百次结果都一样。而且界面上摆的是裸错误码。
+    do {
+        check("ASR_NO_SPEECH 归为没有人声", BrainFailure.isNoSpeech("ASR_NO_SPEECH"), true)
+        check("INVALID_ASR_TIMELINE 也是没有人声", BrainFailure.isNoSpeech("INVALID_ASR_TIMELINE"), true)
+        check("临时故障不算没有人声", BrainFailure.isNoSpeech("PROVIDER_UNAVAILABLE"), false)
+        check("未知原因不算没有人声", BrainFailure.isNoSpeech(nil), false)
+        check("没有人声 → 不给重推", BrainFailure.retryable("ASR_NO_SPEECH"), false)
+        check("临时故障 → 仍给重推", BrainFailure.retryable("PROVIDER_UNAVAILABLE"), true)
+        check("界面不摆裸错误码", BrainFailure.explain("ASR_NO_SPEECH").contains("ASR_NO_SPEECH"), false)
+    }
+
+    // ── 「忽略」要能活过重启 ───────────────────────────────────────
+    // 清单的解码器是逐键手写的：新字段忘了补一行，就会「能写进去、重启后消失」。
+    do {
+        var m = SyncManifest()
+        m.dismissed = ["note20260912-183541"]
+        let data = try! JSONEncoder().encode(m)
+        let back = try! JSONDecoder().decode(SyncManifest.self, from: data)
+        check("忽略名单跨读写还在", back.dismissed.joined(separator: ","), "note20260912-183541")
+        let old = try! JSONDecoder().decode(SyncManifest.self, from: Data(#"{"imported":{}}"#.utf8))
+        check("老清单没有这个键 → 空名单，不报错", old.dismissed.count, 0)
+    }
+
     // ── 录音时刻：文件名信不过时用现场证据 ────────────────────────────
     // 两条都是 2026-09-11 真实事故的原始数据，直接拿日志里的时刻当输入。
     // 公式必须重现人工破案的结论，否则这个修复就只是"看起来对"。

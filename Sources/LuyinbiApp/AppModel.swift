@@ -21,6 +21,7 @@ struct AppActions {
     /// 从设备上删掉这一条（人手指定，不走自动清理那六道闸）
     var deleteFromDevice: @MainActor (RecordingItem) -> Void = { _ in }
     var toggleStar: @MainActor (RecordingItem) -> Void = { _ in }
+    var toggleDismissed: @MainActor (RecordingItem) -> Void = { _ in }
     /// 上传前定标题与项目。已推上去的不生效（引擎侧也挡着）。
     var setPlan: @MainActor (RecordingItem, String?, String?) -> Void = { _, _, _ in }
     var runAudit: @MainActor () -> Void = {}
@@ -67,6 +68,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var pendingBindMismatch: BindMismatch?
     /// 整条推送链为什么停着。非 nil 时主窗口顶部显示横幅。
     @Published private(set) var uploadBlocked: String?
+    /// 登录失效、只有重新登录能解。横幅据此把「查看日志」换成「重新登录」。
+    @Published var needsSignIn = false
     @Published private(set) var lastRun: Date?
     @Published private(set) var lastSummary: String = ""
 
@@ -191,6 +194,7 @@ final class AppModel: ObservableObject {
         phase = engine.phase
         pendingBindMismatch = engine.pendingBindMismatch
         uploadBlocked = engine.uploadBlocked
+        needsSignIn = engine.needsSignIn
         lastRun = engine.lastRun
         lastSummary = engine.lastSummary
         // 选中的行如果没了，清掉选中，别让详情面板悬空。

@@ -30,6 +30,8 @@ public struct RecordingItem: Identifiable, Sendable {
     public var brainTitle: String?
     /// 收藏。纯本地标记——深脑那边没有这个概念，也不该为一个个人偏好去改服务端。
     public var starred = false
+    /// 人手标了「忽略」。只影响计数和配色，不动录音本身。
+    public var dismissed = false
     /// 还没指认的说话人个数。>0 就该进「需要你处理」——
     /// 不指认的话，后面所有洞察里都是「说话人1」。
     public var unconfirmedSpeakers: Int = 0
@@ -67,6 +69,26 @@ public struct DeviceInfo: Sendable {
     public var bindingName: String?
     /// 本机给这支笔的标识（CoreBluetooth peripheral UUID）。改名要用它定位。
     public var peripheralId: String?
+    /// 最后一次**确认这支笔就在旁边**的时刻：收到它的广播，或者跟它连着。
+    ///
+    /// 2026-09-16 用户第三次说「连上之后马上断」。日志里那天真正连不上的只有 2 次，
+    /// 而「连上看一眼没新录音就断开」有 59 次——每一次界面都从「已连接」跳回
+    /// 「未连接」，电量容量固件一起变成「—」。笔明明就在桌上、醒着、一直在广播。
+    /// 「此刻连没连着」回答不了「笔在不在」，广播才回答得了。
+    public var lastSeenAt: Date?
+    /// 电量/容量/固件最近一次真读到的时刻。断开之后照样摆读数，但要说清是几点读的。
+    public var readingsAt: Date?
+
+    /// 笔醒着就会持续广播；空闲几分钟休眠后广播才停。
+    /// 45 秒没收到任何广播、也没连着，才算不在旁边——
+    /// 我们自己断开之后笔要过几秒才重新广播，窗口不能卡得太紧。
+    public static let nearbyWindow: TimeInterval = 45
+
+    public func isNearby(now: Date = Date()) -> Bool {
+        if connected { return true }
+        guard let seen = lastSeenAt else { return false }
+        return now.timeIntervalSince(seen) <= Self.nearbyWindow
+    }
     public init() {}
 }
 

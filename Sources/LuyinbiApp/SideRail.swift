@@ -106,6 +106,11 @@ struct DevicePage: View {
     /// 没有这个出口的话，设备页只能告诉你「已导入」，却不能带你去看。
     var onOpen: (String) -> Void = { _ in }
 
+    /// 「在不在旁边」靠时间判断，而时间流逝本身不会触发重绘——笔休眠后
+    /// 如果没有别的事件，界面会一直停在「在旁边」。每 10 秒推一下。
+    @State private var now = Date()
+    private var nearby: Bool { dev.isNearby(now: now) }
+
     @State private var draftName = ""
     @State private var renaming = false
     @State private var renameNote: String?
@@ -142,6 +147,7 @@ struct DevicePage: View {
             .frame(maxWidth: 620, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { now = $0 }
     }
 
     /// 设备-账号绑定不一致（spec 019）——放在这一页最上面，不能被当成
@@ -285,9 +291,9 @@ struct DevicePage: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Image(systemName: working || dev.connected ? "dot.radiowaves.left.and.right" : "wifi.slash")
+            Image(systemName: working || nearby ? "dot.radiowaves.left.and.right" : "wifi.slash")
                 .font(.system(size: 20))
-                .foregroundStyle(working || dev.connected ? DS.focus : DS.muted)
+                .foregroundStyle(working || nearby ? DS.focus : DS.muted)
             VStack(alignment: .leading, spacing: 2) {
                 Text(dev.name).font(DS.bodyFont(DS.T.head, .semibold))
                     .foregroundStyle(DS.title(scheme == .dark))
@@ -304,6 +310,16 @@ struct DevicePage: View {
     }
 
     private var grid: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            gridCells
+            if !dev.connected, let at = dev.readingsAt {
+                Text("电量、容量、固件读于 \(Self.clock.string(from: at))")
+                    .font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.muted)
+            }
+        }
+    }
+
+    private var gridCells: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)],
                   alignment: .leading, spacing: 10) {
             // **这三格跟标题行、图标用同一个判据（present），不能用瞬时的 connected。**
@@ -352,7 +368,15 @@ struct DevicePage: View {
         case .cleaning:
             return "正在清理录音笔"
         default:
-            return dev.connected ? "已连接" : "未连接——录音笔开机后会自动广播，这里就会亮"
+            // **按「笔在不在旁边」说话，不按「此刻连没连着」说话。**
+            // 笔在旁边、没新录音时，App 连上看一眼约 3 秒就断开——09-16 一天 59 次，
+            // 每次都让这里跳回「未连接」，用户三次来问「为什么连上马上断」。
+            if dev.connected { return "已连接" }
+            if nearby { return "在旁边——没有新录音时连上看一眼就会断开，有新录音会自动搬回来" }
+            if let seen = dev.lastSeenAt {
+                return "没在广播（\(ago(seen))还在）——录音笔空闲几分钟会休眠，按一下按键就会醒"
+            }
+            return "还没找到录音笔——开机后它会自动广播，这里就会亮"
         }
     }
 
@@ -390,9 +414,23 @@ struct DevicePage: View {
     /// - 设备在但还没读到 → 说清楚在等什么（忙的时候本来就不读，窗口留给传输）；
     /// - 设备真的不在 → 「—」。这时候上次的读数确实不能代表现状。
     private func hardware(_ value: String?) -> String {
-        guard working || dev.connected else { return "—" }
-        return value ?? idleHint
+        // 读到过就一直摆着，下面另起一行说是几点读的。
+        // 以前笔一断开就换成「—」，而「连上看一眼就断」一天几十次——
+        // 读数于是一直在闪，看起来就像笔坏了。
+        if let value { return value }
+        return working || nearby ? idleHint : "—"
     }
+
+    private func ago(_ d: Date) -> String {
+        let s = Int(now.timeIntervalSince(d))
+        if s < 60 { return "刚才" }
+        if s < 3600 { return "\(s / 60) 分钟前" }
+        return Self.clock.string(from: d) + " 时"
+    }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
 
     private func stat(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {

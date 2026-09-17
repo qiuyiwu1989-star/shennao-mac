@@ -20,6 +20,12 @@ enum Triage {
         /// 显示成「正在处理」——而根本没有任何人在处理它（2026-09-07 review）。
         case onDeviceOnly
         case skipped       // 太短，按规则只落盘没推
+        /// 转写结果是「没有人声」。**不是故障，是内容本身为空**（误按录音键、笔在包里）。
+        /// 以前算「转写失败」、标红、进计数，而且没有任何办法消掉——
+        /// 2026-09-16 用户原话：「这些错误信息我看着又消除不掉，就会有点头疼」。
+        case noSpeech
+        /// 真失败、但人手标了「忽略」。不再计入待办，录音和深脑记录都不动。
+        case dismissed
         case pendingDel    // 排队等着从设备删
         case done          // 一切正常
 
@@ -31,6 +37,8 @@ enum Triage {
             case .queued:       return "排队等推送"
             case .working:      return "正在进行"
             case .skipped:      return "太短未推送"
+            case .noSpeech:     return "没有人声"
+            case .dismissed:    return "已忽略"
             case .liveOnDevice: return "录音笔正在录"
             case .onDeviceOnly: return "还在录音笔上"
             case .pendingDel:   return "等着从设备删"
@@ -45,6 +53,8 @@ enum Triage {
             case .queued:       return "arrow.up.circle"
             case .working:      return "arrow.down.circle"
             case .skipped:      return "clock.badge.questionmark"
+            case .noSpeech:     return "waveform.slash"
+            case .dismissed:    return "eye.slash"
             case .liveOnDevice: return "record.circle"
             case .onDeviceOnly: return "externaldrive"
             case .pendingDel:   return "trash"
@@ -60,6 +70,9 @@ enum Triage {
             // 排队和「正在进行」同色：它们是同一件事的两个阶段，不是两种状态。
             case .queued:       return DS.focusBright
             case .skipped:      return DS.ink300
+            // 这两个都是「不用你管」，跟「太短未推送」同一个中性色，别喊。
+            case .noSpeech:     return DS.ink300
+            case .dismissed:    return DS.ink300
             // 这两个都不是「进行中」，不能用那个蓝——用中性色，别喊。
             case .liveOnDevice: return DS.ink300
             case .onDeviceOnly: return DS.ink300
@@ -76,6 +89,8 @@ enum Triage {
             case .queued:       return "在上传队列里等着，轮到就推"
             case .working:      return "正在搬，等着就行"
             case .skipped:      return "本地留着了，需要的话可以手动推给深脑"
+            case .noSpeech:     return "录音里没检测到人声，多半是误按了录音键，不用管"
+            case .dismissed:    return "你标了忽略，不再计入待办；想恢复可以取消忽略"
             case .liveOnDevice: return "录完自己就会同步，不用管"
             case .onDeviceOnly: return "等录音笔连上就会自动导入"
             case .pendingDel:   return "设备下次连上就删"
@@ -95,7 +110,13 @@ enum Triage {
         if item.lastError?.contains("录音中") == true { return .liveOnDevice }
         // 太短是「按你定的规则跳过」，不是故障——不能混进待办里让人以为出了问题
         if item.skippedShortSeconds != nil && !item.inBrain { return .skipped }
-        if item.brainStatus == "failed" { return .failed }
+        if item.brainStatus == "failed" {
+            // 顺序有讲究：「没有人声」先判——它根本不该算失败，
+            // 也就谈不上要不要人手去忽略它。
+            if BrainFailure.isNoSpeech(item.brainErrorCode) { return .noSpeech }
+            if item.dismissed { return .dismissed }
+            return .failed
+        }
         if item.inBrain && item.unconfirmedSpeakers > 0 { return .needsSpeaker }
         if item.lastError != nil && !item.inBrain { return .stuck }
         // 落了盘却没 sessionId 有两种：**还没轮到**、和**试过推不上去**。

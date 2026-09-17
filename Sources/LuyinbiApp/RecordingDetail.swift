@@ -114,6 +114,15 @@ struct RecordingDetailView: View {
                     .help("换一个幂等键重新建会话推一遍")
             }
 
+            // 重推也好不了的失败，给一个让它离开待办的出口。
+            // 没有这个按钮，这一条就永远挂在「失败 N」里，而你对它什么都做不了。
+            // 「没有人声」不给：它本来就不算失败，不用忽略。
+            if item.brainStatus == "failed", !BrainFailure.isNoSpeech(item.brainErrorCode),
+               !BrainFailure.retryable(item.brainErrorCode) || item.dismissed {
+                Button(item.dismissed ? "取消忽略" : "忽略这条") { model.actions.toggleDismissed(item) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .help(item.dismissed ? "重新计入待办" : "不再计入「失败」，录音和深脑里的记录都不动")
+            }
             Button(item.starred ? "取消收藏" : "收藏") { model.actions.toggleStar(item) }
                 .buttonStyle(DSSecondaryButtonStyle())
 

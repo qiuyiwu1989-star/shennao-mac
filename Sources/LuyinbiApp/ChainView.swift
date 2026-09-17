@@ -75,8 +75,15 @@ struct ChainStatus {
             diskNote = "尚未落盘"
         }
 
+        // 「没有人声」不是哪一站坏了，是录音本身是空的。链条上画红三角，
+        // 等于在说「这里出故障了、你得去修」——而实际上没有任何可修的。
+        let noSpeech = item.brainStatus == "failed" && BrainFailure.isNoSpeech(item.brainErrorCode)
+
         // 深脑段
-        if item.inBrain {
+        if noSpeech {
+            brain = .done
+            brainNote = "已收到"
+        } else if item.inBrain {
             brain = .done
             brainNote = "已就绪，转写完成"
         } else if item.brainStatus == "failed" || (item.lastError != nil && item.sessionId != nil) {
@@ -96,7 +103,10 @@ struct ChainStatus {
         // 转写段。深脑收到不等于转写好了——这两段以前挤在「深脑」一格里，
         // 于是「推上去了但还没转写」和「转写完了」长得一样，
         // 而「卡住」十有八九就卡在这两段之间。
-        if item.transcriptId != nil {
+        if noSpeech {
+            transcript = .skipped
+            transcriptNote = BrainFailure.explain(item.brainErrorCode)
+        } else if item.transcriptId != nil {
             transcript = .done
             transcriptNote = "转写就绪"
         } else if item.brainStatus == "failed" {
@@ -112,7 +122,11 @@ struct ChainStatus {
 
         // 分析段。有标题就是分析跑完了——深脑起标题是分析的产物，
         // 还是文件名就说明判断还没沉下去。
-        if item.brainTitle != nil {
+        if noSpeech {
+            // 写「等转写」是在承诺一件永远不会发生的事。
+            analysis = .skipped
+            analysisNote = "没有可分析的内容"
+        } else if item.brainTitle != nil {
             analysis = .done
             analysisNote = "判断已沉进大脑"
         } else if item.transcriptId != nil {

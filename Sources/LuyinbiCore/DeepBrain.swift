@@ -20,6 +20,10 @@ public struct DeepBrainConfig: Codable {
 
 public enum DeepBrainError: Error, CustomStringConvertible {
     case notLoggedIn
+    /// 服务端明确不认这份登录了（刷新令牌 400/401）。**不是网络问题，重试多少次都一样**，
+    /// 只有重新登录能解。必须跟 `.http` 分开——混在一起，它就会被当成一次偶发失败，
+    /// 按指数退避无限重试下去。
+    case sessionRevoked
     case http(String, Int, String)
     case badResponse(String)
     /// 录音链路来的转写是「权威数据」，深脑只允许服务端改。
@@ -30,6 +34,8 @@ public enum DeepBrainError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .notLoggedIn: return "尚未登录深脑"
+        case .sessionRevoked:
+            return "登录已失效——在网页或别的设备上点「退出登录」会连带让这里失效，重新登录一次即可"
         case .http(let what, let code, let body): return "\(what) 失败 HTTP \(code)：\(body.prefix(200))"
         case .badResponse(let s): return "应答不符合预期：\(s)"
         case .canonicalReadOnly:
@@ -76,6 +82,8 @@ public final class DeepBrain {
     // 模块内可见：Speakers.swift 里的扩展要用（Swift 的 private 是文件级的）
     let config: DeepBrainConfig
     var token: String?
+    /// 刷新拿到了新令牌、却没写进本机。见 connect() 里的注释。
+    public private(set) var credentialWriteFailed = false
     var org: String?
     /// transcript_id -> recording_session_id。指认接口按会话寻址，而 App 全程拿的是
     /// transcript_id；这个映射一条录音只查一次。
@@ -140,11 +148,26 @@ public final class DeepBrain {
         let (st, data) = try await request(
             "POST", "\(config.supabaseUrl)/auth/v1/token?grant_type=refresh_token",
             headers: ["apikey": config.supabaseAnonKey], json: ["refresh_token": refresh])
+        // 400/401 = 服务端不认这个刷新令牌了，重新登录之前永远不会好。
+        //
+        // 2026-09-14 实测：网页端的「退出登录」调的是 signOut() 不带参数，
+        // 而 auth-js 的默认值是 scope: 'global'——浏览器里点一次退出，
+        // 这个账号在所有设备上的会话一起被删。Mac 这边拿着的令牌于是变成
+        // 「Refresh Token Not Found」。以前这里一律报 .http，被当成偶发失败，
+        // 一条录音重试了 6 次、间隔拖到 16 分钟，界面只写「推送卡住」。
+        // （原文案「请用 Python 版重新登录」也早就过时了——Mac 端有自己的登录。）
+        if st == 400 || st == 401 { throw DeepBrainError.sessionRevoked }
         guard st < 400, let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let access = d["access_token"] as? String else {
-            throw DeepBrainError.http("刷新登录", st, "登录已失效，请用 Python 版重新登录")
+            throw DeepBrainError.http("刷新登录", st, String(decoding: data, as: UTF8.self))
         }
-        if let newRefresh = d["refresh_token"] as? String { TokenStore.set(newRefresh) }
+        // **新的刷新令牌必须写进本机，写失败要留痕。**
+        // 服务端开着令牌轮换：这一次刷新之后，旧令牌就作废了。新令牌没存下来，
+        // 下一次就会拿作废的旧令牌去刷——结果跟被全局退出一模一样，而原因完全不同。
+        // 以前 set 的返回值被直接丢掉，出了事根本分不清是哪一种。
+        if let newRefresh = d["refresh_token"] as? String, !TokenStore.set(newRefresh) {
+            credentialWriteFailed = true
+        }
         token = access
         org = try await resolveOrg(access)
     }
@@ -450,6 +473,7 @@ public extension DeepBrain {
             try await brain.connect()
             return .valid
         } catch let e as DeepBrainError {
+            if case .sessionRevoked = e { return .expired }
             if case .http(_, let code, _) = e, code >= 400, code < 500 { return .expired }
             return .unreachable
         } catch {

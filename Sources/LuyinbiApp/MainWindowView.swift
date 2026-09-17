@@ -20,6 +20,7 @@ struct MainWindowView: View {
     }
 
     @State private var section: RailSection = .library
+    @State private var railNow = Date()
 
     /// 内容区：录音清单 + 工作台。设备和录音各自独占整块右侧。
     private var librarySplit: some View {
@@ -51,8 +52,9 @@ struct MainWindowView: View {
             if let blocked = model.uploadBlocked { blockedBanner(blocked) }
             Divider()
             HStack(spacing: 0) {
+                // 侧栏的点跟设备页同一个判据：笔在旁边就亮，不看此刻连没连着。
                 SideRail(section: $section,
-                         deviceConnected: model.device.connected || model.isBusy)
+                         deviceConnected: model.device.isNearby(now: railNow) || model.isBusy)
                     .frame(width: 132)
                 Divider()
                 switch section {
@@ -66,6 +68,7 @@ struct MainWindowView: View {
             }
         }
         .frame(minWidth: 1000, minHeight: 600)
+        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { railNow = $0 }
         .background(DS.bg(scheme == .dark))
     }
 
@@ -83,8 +86,18 @@ struct MainWindowView: View {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DS.warn)
             Text(text).font(DS.bodyFont(DS.T.meta)).foregroundStyle(DS.title(scheme == .dark))
             Spacer(minLength: 8)
-            Button("查看日志") { model.actions.openLog() }
-                .buttonStyle(DSSecondaryButtonStyle())
+            if model.needsSignIn {
+                // 登录失效有明确的一步可做，按钮就该是那一步，而不是「查看日志」。
+                // 走的是已有的登录页（清掉作废的凭证 → 显示登录页），不另造一条路。
+                Button("重新登录") {
+                    model.actions.signOut()
+                    model.sessionNotice = "登录已失效，请重新登录。登录后积压的录音会自动推上去。"
+                }
+                .buttonStyle(DSPrimaryButtonStyle())
+            } else {
+                Button("查看日志") { model.actions.openLog() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+            }
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(DS.warn.opacity(0.12))

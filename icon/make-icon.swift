@@ -9,10 +9,21 @@ let S: CGFloat = 1024          // 主画布
 // 独立于坐标系统一放大，留出一个「万一小尺寸下这两处显得太细」的调节口。
 let boost: CGFloat = 1.0
 
-func drawIcon(size: CGFloat) -> NSImage {
-    let img = NSImage(size: NSSize(width: size, height: size))
-    img.lockFocus()
-    guard let ctx = NSGraphicsContext.current?.cgContext else { img.unlockFocus(); return img }
+// **画在明确是 sRGB 的离屏画布上，不借用显示器的色彩空间。**
+//
+// 原来是 NSImage.lockFocus() + CGColorSpaceCreateDeviceRGB()，两者都跟着「当前主显示器」走。
+// 2026-09-16 核发布包时发现：1.2.8 构建时主屏是 MacBook 自带屏，PNG 带 Display P3 配置文件，
+// 头部像素 (224,126,110)；1.2.10 构建时主屏是一台小米电视，PNG 带的配置文件叫「Mi TV」，
+// 同一个像素变成 (243,117,106)，.icns 也从 1518 KB 变成 1145 KB。
+// 也就是说**同一份源码，接哪块显示器打包，用户就拿到哪块显示器的颜色**——
+// 那个包要是发出去，所有人的图标都带着一台电视机的色彩配置。
+// 设计值珊瑚红 (0.94,0.47,0.41) 就是 sRGB 下的 (240,120,105)，画在 sRGB 上才落得准。
+let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+
+func drawIcon(size: CGFloat) -> CGImage {
+    let px = Int(size)
+    let ctx = CGContext(data: nil, width: px, height: px, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: srgb, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     let k = size / S           // 所有坐标按 1024 设计，这里等比缩放
     ctx.scaleBy(x: k, y: k)
     ctx.setAllowsAntialiasing(true)
@@ -23,7 +34,7 @@ func drawIcon(size: CGFloat) -> NSImage {
     let plate = CGPath(roundedRect: bezel, cornerWidth: 229, cornerHeight: 229, transform: nil)
     ctx.saveGState()
     ctx.addPath(plate); ctx.clip()
-    let cs = CGColorSpaceCreateDeviceRGB()
+    let cs = srgb
     let grad = CGGradient(colorsSpace: cs, colors: [
         CGColor(colorSpace: cs, components: [1.0, 0.99, 0.98, 1])!,
         CGColor(colorSpace: cs, components: [0.99, 0.95, 0.93, 1])!,
@@ -96,15 +107,21 @@ func drawIcon(size: CGFloat) -> NSImage {
     }
     ctx.strokePath()
 
-    img.unlockFocus()
-    return img
+    return ctx.makeImage()!
 }
 
-func png(_ img: NSImage, _ path: String) {
-    guard let tiff = img.tiffRepresentation,
-          let rep = NSBitmapImageRep(data: tiff),
-          let data = rep.representation(using: .png, properties: [:]) else { return }
-    try? data.write(to: URL(fileURLWithPath: path))
+/// 直接用 ImageIO 写 PNG：色彩配置文件就是画布的 sRGB，不经过 NSImage 再转一道。
+func png(_ img: CGImage, _ path: String) {
+    let url = URL(fileURLWithPath: path) as CFURL
+    guard let dest = CGImageDestinationCreateWithURL(url, "public.png" as CFString, 1, nil) else {
+        FileHandle.standardError.write("写不了 \(path)\n".data(using: .utf8)!)
+        exit(1)
+    }
+    CGImageDestinationAddImage(dest, img, nil)
+    guard CGImageDestinationFinalize(dest) else {
+        FileHandle.standardError.write("写 \(path) 失败\n".data(using: .utf8)!)
+        exit(1)
+    }
 }
 
 let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."

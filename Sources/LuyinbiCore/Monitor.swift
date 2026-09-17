@@ -63,6 +63,9 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     /// 收藏的 base 列表。放清单里而不是单开一个文件——
     /// 它和「已导入/已上传/已删除」是同一类账，一起读一起写不会打架。
     public var starred: [String] = []
+    /// 人手标了「忽略」的失败条目。**只是不再计入待办、不再标红**——
+    /// 录音、转写、深脑里的记录一样都不动。跟 starred 同一类账，放在一起。
+    public var dismissed: [String] = []
     /// 上传**之前**定的标题与项目归属。
     ///
     /// 为什么只能在上传前定：录音链路产生的转写受 canonical 守卫保护，
@@ -100,7 +103,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case imported, uploaded, deleted, starred, plan, downloadFailures, repushRounds
+        case imported, uploaded, deleted, starred, dismissed, plan, downloadFailures, repushRounds
     }
 
     /// 逐键容错解码：某一个键的结构变了（比如 Cleanup 换了 deleted 的写法），
@@ -113,6 +116,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
         // 新增字段必须在这里补一行，否则「能写进去、重启后消失」——
         // 编译不报错，功能静默失效，最难查的那种。
         starred = (try? c.decode([String].self, forKey: .starred)) ?? []
+        dismissed = (try? c.decode([String].self, forKey: .dismissed)) ?? []
         plan = (try? c.decode([String: Plan].self, forKey: .plan)) ?? [:]
         downloadFailures = (try? c.decode([String: Int].self, forKey: .downloadFailures)) ?? [:]
         repushRounds = (try? c.decode([String: Int].self, forKey: .repushRounds)) ?? [:]
@@ -264,6 +268,15 @@ public enum SyncPlanner {
         return String(collapsed.prefix(64))
     }
 
+    /// 批量推送时这一条是不是太短、只落盘不推。
+    ///
+    /// **签名里故意没有 force 参数。** 它曾经有过，结果「别等重试间隔」和
+    /// 「人手指定要推」被混成一个开关，一次重新登录就把三条几秒钟的录音推进了深脑。
+    /// 人手推短录音走 pushNow，不经过这里。
+    public static func tooShortToUpload(duration: Double, floorSeconds: Int) -> Bool {
+        floorSeconds > 0 && duration < Double(floorSeconds)
+    }
+
     /// 连续失败多少次之后不再自动重试。
     ///
     /// 5 次的来历：真实的可恢复失败（信号弱、设备正忙、连接抖动）实测最多两三次
@@ -405,7 +418,8 @@ public enum SyncPlanner {
                                   plans: [String: SyncManifest.Plan] = [:],
                                   skippedShort: [String: Double] = [:],
                                   pendingDelete: Set<String> = [],
-                                  starred: Set<String> = []) -> [RecordingItem] {
+                                  starred: Set<String> = [],
+                                  dismissed: Set<String> = []) -> [RecordingItem] {
         var out: [String: RecordingItem] = [:]
 
         for e in entries {
@@ -459,6 +473,7 @@ public enum SyncPlanner {
             out[base]?.skippedShortSeconds = skippedShort[base]
             out[base]?.pendingDeviceDelete = pendingDelete.contains(base)
             out[base]?.starred = starred.contains(base)
+            out[base]?.dismissed = dismissed.contains(base)
         }
         return out.values.sorted { $0.base > $1.base }
     }
@@ -527,6 +542,11 @@ public final class SyncEngine: ObservableObject {
     /// 整条推送链为什么停着（连不上深脑/登录失效）。非 nil 时主窗口顶部挂一条横幅。
     /// 症状（「推送卡住」）到处都是，病因只有一个地方知道——就是这里。
     @Published public private(set) var uploadBlocked: String?
+    /// 服务端不认这份登录了，只有重新登录能解。为 true 时推送整条停下、不再打网络。
+    ///
+    /// 跟 uploadBlocked 分开是因为界面要**给出口**：连不上网只能等，
+    /// 而登录失效有明确的一步可做——横幅上直接给「重新登录」按钮。
+    @Published public private(set) var needsSignIn = false
     /// base -> 文件后缀（ogg / m4a）。上传时要按它取文件和 mime。
     private var uploadExt: [String: String] = [:]
 
@@ -715,6 +735,9 @@ public final class SyncEngine: ObservableObject {
 
         for await found in client.advertisements() {
             if !monitoring || Task.isCancelled { break }
+            // 先记「笔在旁边」，再看冷却要不要连。以前冷却期内的广播直接丢掉，
+            // 于是界面只知道「此刻没连着」，不知道笔就在桌上醒着。
+            if let seen = pick([found]) { noteSeen(seen) }
             if isSyncing { continue }              // 正在同步就跳过，别断流
             if isFailed(phase) { phase = .waitingForDevice }
             guard let target = pick([found]), passedCooldown(target) else { continue }
@@ -726,6 +749,19 @@ public final class SyncEngine: ObservableObject {
 
         monitorTask = nil
         if monitoring == false && !isFailed(phase) && !isSyncing { phase = .idle }
+    }
+
+    /// 记下「这支笔刚刚还在广播」。笔醒着时一秒能来好几条广播，
+    /// 每条都改 @Published 会让界面一直重绘，所以 5 秒内只记一次。
+    private func noteSeen(_ d: Discovered, now: Date = Date()) {
+        if let last = device.lastSeenAt, now.timeIntervalSince(last) < 5 { return }
+        // 只在「消失一阵又回来」时写一行。以后有人问「为什么连不上」，
+        // 先看这一行：笔那段时间到底有没有在广播。
+        if let last = device.lastSeenAt, now.timeIntervalSince(last) > DeviceInfo.nearbyWindow {
+            log.write("录音笔又开始广播了（上次见到是 \(Self.stamp(last))，中间 \(Int(now.timeIntervalSince(last) / 60)) 分钟没有信号）")
+        }
+        device.lastSeenAt = now
+        if device.name == "—" { device.name = d.name }
     }
 
     private func pick(_ found: [Discovered]) -> Discovered? {
@@ -829,12 +865,15 @@ public final class SyncEngine: ObservableObject {
             return
         }
         device.connected = true
+        device.lastSeenAt = Date()
         log.write("已连接 \(target.name) rssi=\(target.rssi)")
         // 无论中途从哪儿返回，都必须断开——不断开录音笔会一直被我们占着，
         // 手机 App 连不上，而且它也不会进入低功耗重新广播。
         defer {
             client.disconnect()
             device.connected = false
+            // 我们自己断开的那一刻，笔确实就在旁边——别让界面在它重新广播之前那几秒里喊「不在」。
+            device.lastSeenAt = Date()
         }
 
         guard await ensureDeviceBinding(target) else { return }
@@ -1310,6 +1349,7 @@ public final class SyncEngine: ObservableObject {
         guard client.isConnected else { return }
         if let v = (try? await client.battery()) ?? nil {
             device.battery = v
+            device.readingsAt = Date()
             checkBattery(v)
         } else { missed.append("电量") }
 
@@ -1325,6 +1365,7 @@ public final class SyncEngine: ObservableObject {
         if let cap = (try? await client.capacity()) ?? nil {
             device.capacityRemain = cap.remain
             device.capacityTotal = cap.total
+            device.readingsAt = Date()
             // **把原始值和当前列表的实际占用一起记下来，用来标定单位。**
             //
             // 容量这两个数的单位至今没有定论：厂商文档标 8KB/格，早期实测觉得
@@ -1392,6 +1433,13 @@ public final class SyncEngine: ObservableObject {
         guard !uploadQueue.isEmpty else { refreshLocalView(); return 0 }
 
         guard let brain = await ensureBrain() else {
+            if needsSignIn {
+                lastSummary = "登录已失效，本次只落盘"
+                uploadBlocked = "推送暂停：登录已失效（\(uploadQueue.count) 条在等）。"
+                    + "在网页或别的设备上点「退出登录」会连带让这里失效，重新登录一次，这些会自动推上去"
+                refreshLocalView()
+                return 0
+            }
             lastSummary = "深脑未接通，本次只落盘"
             // **把「为什么推不上去」摆到界面上，而不是只留在日志里。**
             // 2026-09-07：登录失效期间，界面上每一条都显示「推送卡住」，
@@ -1492,9 +1540,17 @@ public final class SyncEngine: ObservableObject {
             guard duration > 0 else { continue }
 
             // 太短的只落盘不推：花钱的是转写和分析，不是下载。
-            // force=true（人手点「推送」）时忽略这道门槛——你说要推就是要推。
+            //
+            // **这道门槛在批量队列里没有例外。**
+            // 这里原来写的是 `if !force, …`，注释说「force=true 是人手点推送」——
+            // 那是错的：单条「推送」按钮走的是 pushNow，根本不经过这个队列。
+            // 走到这里的 force 全是批量路径（登录后补推、retryUploads），
+            // 意思只是「别等重试间隔」。2026-09-14 重新登录那一下，
+            // 三条 1/7/12 秒的录音被一起推进深脑：两条转写失败（没有人声），
+            // 在 Mac 端挂成「失败 2」消不掉；另两条白白花了转写。
+            // 人手要推短录音，请走单条的 pushNow。
             let floor = cleanup.minUploadSeconds
-            if !force, floor > 0, duration < Double(floor) {
+            if SyncPlanner.tooShortToUpload(duration: duration, floorSeconds: floor) {
                 if skippedShort[base] == nil {
                     skippedShort[base] = duration
                     log.write(String(format: "%@ 只有 %.0f 秒，短于 %d 秒门槛，只落盘不推深脑",
@@ -1536,6 +1592,11 @@ public final class SyncEngine: ObservableObject {
                 log.write("推深脑 \(mergedBases.joined(separator: "+")) 会话 \(up.sessionId)"
                           + (up.alreadyDone ? "（幂等重放，未重传）" : ""))
                 ok += 1
+            } catch DeepBrainError.sessionRevoked {
+                // 登录在这一轮中途失效（访问令牌过期、刷新被拒）。
+                // 剩下的每一条都会以同样的原因失败，没必要一条条去撞。
+                markSessionRevoked()
+                break
             } catch {
                 // **按 base 找，不按下标写回。** 下标是循环开始时那份快照的位置，
                 // 而 `await brain.upload` 中间任何一次让出，都可能有另一条路径
@@ -1583,7 +1644,19 @@ public final class SyncEngine: ObservableObject {
             .prefix(limit)
         guard !todo.isEmpty else { return }
         for (base, sid) in todo {
-            guard let st = try? await brain.sessionState(sid) else { continue }
+            let st: DeepBrain.SessionState
+            do {
+                st = try await brain.sessionState(sid)
+            } catch DeepBrainError.sessionRevoked {
+                // 这条轮询也会撞上失效的登录（它查的是还没处理完的会话）。
+                // 以前这里是 try?，失效被当成「查不到」吞掉，界面停在「处理中」。
+                // 真正要推的录音那条路也已接住（见 flushUploadQueue）：
+                // 一条新录音导入后立刻推，第一次失败就亮横幅，不再静默退避。
+                markSessionRevoked()
+                return
+            } catch {
+                continue
+            }
             brainState[base] = (st.status, st.transcriptId, st.errorCode)
         }
         // 顺带批量拉一次「还没指认的说话人」——待办区靠它判断要不要认人。
@@ -1658,7 +1731,8 @@ public final class SyncEngine: ObservableObject {
                                            uniquingKeysWith: { a, _ in a }),
                                        plans: manifest.plan,
                                        skippedShort: skippedShort, pendingDelete: pendingDeviceDelete,
-                                       starred: Set(SyncManifest.load(from: paths.manifest).starred))
+                                       starred: Set(manifest.starred),
+                                       dismissed: Set(manifest.dismissed))
     }
 
     /// 目录下某扩展名的文件：base → 字节数。
@@ -1731,11 +1805,53 @@ public final class SyncEngine: ObservableObject {
     /// 深脑接不通不是致命错误——照 pull.py 的做法，落盘照做，只是不推。
     private func ensureBrain() async -> DeepBrain? {
         if let brain { return brain }
+        guard !needsSignIn else { return nil }     // 已知令牌作废：别再拿它去撞服务端
         guard let cfg = try? DeepBrainConfig.load(from: paths.deepBrainConfig) else { return nil }
         let b = DeepBrain(config: cfg)
-        guard (try? await b.connect()) != nil else { return nil }
+        do {
+            try await b.connect()
+        } catch DeepBrainError.sessionRevoked {
+            markSessionRevoked()
+            return nil
+        } catch {
+            return nil
+        }
+        if b.credentialWriteFailed {
+            log.write("刷新了登录，但新的登录凭据没能写进本机——下次刷新会被服务端判为失效。"
+                      + "凭据文件：\(TokenStore.path)")
+        }
         brain = b
         return b
+    }
+
+    /// 服务端不认这份登录了。停掉整条推送，把原因和出口摆到界面上。
+    private func markSessionRevoked() {
+        brain = nil
+        guard !needsSignIn else { return }
+        needsSignIn = true
+        // **这些失败不是文件的错。** 把登录失效期间累积的尝试次数清零——
+        // 否则重新登录之后，它们还挂着「推送卡住」和十几分钟的退避，
+        // 要干等一轮才会重推。
+        for i in uploadQueue.indices {
+            uploadQueue[i].attempts = 0
+            uploadQueue[i].nextAttempt = .distantPast
+            uploadQueue[i].lastError = nil
+            errors[uploadQueue[i].base] = nil
+        }
+        uploadBlocked = "推送暂停：登录已失效（\(uploadQueue.count) 条在等）。"
+            + "在网页或别的设备上点「退出登录」会连带让这里失效，重新登录一次，这些会自动推上去"
+        log.write("登录已失效（服务端不认这个刷新令牌），推送暂停，等重新登录。"
+                  + "常见原因：在网页上退出登录会让所有设备一起失效")
+        refreshLocalView()
+    }
+
+    /// 界面调用：刚刚重新登录成功。立刻把积压的推上去，不等下一轮定时器。
+    public func signedInAgain() {
+        needsSignIn = false
+        brain = nil
+        uploadBlocked = nil
+        log.write("已重新登录，开始补推积压的录音")
+        Task { _ = await flushUploadQueue(force: true) }
     }
 
     /// 保存清单，失败必须留痕。
@@ -2194,11 +2310,22 @@ public enum BrainFailure {
     /// 重推同一份音频不会有不同结果
     public static let permanent: Set<String> = [
         "INVALID_ASR_TIMELINE",     // 转写没返回任何语音段
+        "ASR_NO_SPEECH",            // 没检测到人声
         "PROVIDER_REJECTED",
         "ASR_TASK_EVIDENCE_MISSING",
         "MANIFEST_INCOMPLETE",
         "OBJECT_MISMATCH",
     ]
+
+    /// 「录音里没有人声」这一类。**不是故障，是内容本身为空**——
+    /// 多半是误按了录音键、或者笔在包里。界面上不标红、不计入失败，
+    /// 否则一堆一秒钟的空录音会让人以为同步坏了，而且永远消不掉。
+    public static let noSpeech: Set<String> = ["ASR_NO_SPEECH", "INVALID_ASR_TIMELINE"]
+
+    public static func isNoSpeech(_ code: String?) -> Bool {
+        guard let code else { return false }
+        return noSpeech.contains(code)
+    }
 
     public static func retryable(_ code: String?) -> Bool {
         guard let code, !code.isEmpty else { return true }   // 不知道原因就允许试一次
@@ -2210,6 +2337,8 @@ public enum BrainFailure {
         switch code {
         case "INVALID_ASR_TIMELINE":
             return "转写没能识别出任何语音。这段录音里可能没有清晰人声（比如放在包里、只有环境噪音），重推同一份音频结果不会变。"
+        case "ASR_NO_SPEECH":
+            return "这段录音里没有检测到人声，不是故障——多半是误按了录音键，或者笔放在包里。"
         case "PROVIDER_UNAVAILABLE":
             return "转写服务暂时不可用，属于临时故障，可以重推。"
         case "PROVIDER_REJECTED":
@@ -2454,6 +2583,15 @@ public extension SyncEngine {
         let t = title?.trimmingCharacters(in: .whitespaces).nilIfEmpty
         if t == nil && projectId == nil { m.plan.removeValue(forKey: base) }
         else { m.plan[base] = SyncManifest.Plan(title: t, projectId: projectId) }
+        persist(m)
+        refreshLocalView()
+    }
+
+    /// 失败条目标「忽略」/取消忽略。只改本地账，深脑里什么都不动。
+    func toggleDismissed(_ base: String) {
+        var m = SyncManifest.load(from: paths.manifest)
+        if let i = m.dismissed.firstIndex(of: base) { m.dismissed.remove(at: i) }
+        else { m.dismissed.append(base) }
         persist(m)
         refreshLocalView()
     }

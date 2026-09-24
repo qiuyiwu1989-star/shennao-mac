@@ -66,6 +66,14 @@ public struct SyncManifest: Codable, Equatable, Sendable {
     /// 人手标了「忽略」的失败条目。**只是不再计入待办、不再标红**——
     /// 录音、转写、深脑里的记录一样都不动。跟 starred 同一类账，放在一起。
     public var dismissed: [String] = []
+    /// 深脑明确回 404 的会话：**它在服务端已经没了，再查一百次也还是没有。**
+    /// base → 判定时刻。必须落盘：只记在内存里的话，重启之后又会从头查起——
+    /// 2026-09-18 实测就是这样，8 条早已删除的录音每 48 秒被查一次，
+    /// 7 天 88,923 次 404，占深脑全站请求的 24.6%，跨 10 个客户端版本都在刷。
+    public var missingOnServer: [String: String] = [:]
+    /// 轮询连续失败次数（非 404 的那些：网络抖动、服务端 5xx）。
+    /// 总闸：攒够 `SyncPlanner.pollGiveUpAfter` 次就不再查，别让任何一条永远占着轮询名额。
+    public var pollFailures: [String: Int] = [:]
     /// 上传**之前**定的标题与项目归属。
     ///
     /// 为什么只能在上传前定：录音链路产生的转写受 canonical 守卫保护，
@@ -104,6 +112,7 @@ public struct SyncManifest: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case imported, uploaded, deleted, starred, dismissed, plan, downloadFailures, repushRounds
+        case missingOnServer, pollFailures
     }
 
     /// 逐键容错解码：某一个键的结构变了（比如 Cleanup 换了 deleted 的写法），
@@ -117,6 +126,8 @@ public struct SyncManifest: Codable, Equatable, Sendable {
         // 编译不报错，功能静默失效，最难查的那种。
         starred = (try? c.decode([String].self, forKey: .starred)) ?? []
         dismissed = (try? c.decode([String].self, forKey: .dismissed)) ?? []
+        missingOnServer = (try? c.decode([String: String].self, forKey: .missingOnServer)) ?? [:]
+        pollFailures = (try? c.decode([String: Int].self, forKey: .pollFailures)) ?? [:]
         plan = (try? c.decode([String: Plan].self, forKey: .plan)) ?? [:]
         downloadFailures = (try? c.decode([String: Int].self, forKey: .downloadFailures)) ?? [:]
         repushRounds = (try? c.decode([String: Int].self, forKey: .repushRounds)) ?? [:]
@@ -266,6 +277,34 @@ public enum SyncPlanner {
             .filter { !$0.isEmpty }
             .joined(separator: "-")
         return String(collapsed.prefix(64))
+    }
+
+    /// 轮询连续失败多少次之后不再查这一条。
+    ///
+    /// 跟下载的 giveUpAfter 分开：那边一次失败代价是一段连接时间，这边是一次 HTTP 请求，
+    /// 便宜得多，所以可以多给几次。但**必须有个头**——没有总闸的话，任何一种
+    /// 「服务端答不上来」都会变成永久轮询。
+    public static let pollGiveUpAfter = 8
+
+    /// 这一轮要去深脑查状态的是哪几条。
+    ///
+    /// **抽成纯函数是因为「不该再查」有三个互不相干的理由**，混在调用点里写，
+    /// 漏掉任何一个都表现为「安静地一直刷请求」，而日志和界面上什么都看不出来：
+    ///   1. 已经查到终态（就绪/失败/已删），没必要再问；
+    ///   2. 深脑明确说这条不存在（404），再问一万次还是不存在；
+    ///   3. 连续失败够多次，先不问了，别占着名额。
+    public static func pollTargets(uploaded: [String: String],
+                                   terminal: Set<String>,
+                                   missingOnServer: Set<String>,
+                                   pollFailures: [String: Int],
+                                   limit: Int = 12) -> [(base: String, sessionId: String)] {
+        uploaded
+            .filter { !terminal.contains($0.key) }
+            .filter { !missingOnServer.contains($0.key) }
+            .filter { (pollFailures[$0.key] ?? 0) < pollGiveUpAfter }
+            .sorted { $0.key > $1.key }
+            .prefix(limit)
+            .map { (base: $0.key, sessionId: $0.value) }
     }
 
     /// 批量推送时这一条是不是太短、只落盘不推。
@@ -419,7 +458,8 @@ public enum SyncPlanner {
                                   skippedShort: [String: Double] = [:],
                                   pendingDelete: Set<String> = [],
                                   starred: Set<String> = [],
-                                  dismissed: Set<String> = []) -> [RecordingItem] {
+                                  dismissed: Set<String> = [],
+                                  missingOnServer: Set<String> = []) -> [RecordingItem] {
         var out: [String: RecordingItem] = [:]
 
         for e in entries {
@@ -474,6 +514,7 @@ public enum SyncPlanner {
             out[base]?.pendingDeviceDelete = pendingDelete.contains(base)
             out[base]?.starred = starred.contains(base)
             out[base]?.dismissed = dismissed.contains(base)
+            out[base]?.serverGone = missingOnServer.contains(base)
         }
         return out.values.sorted { $0.base > $1.base }
     }
@@ -1638,15 +1679,33 @@ public final class SyncEngine: ObservableObject {
     /// 查一下已推条目在深脑那边处理到哪了。查不到不算错，界面上就停在「处理中」。
     private func refreshBrainStatus(_ manifest: SyncManifest, limit: Int = 12) async {
         guard let brain = await ensureBrain() else { return }
-        let todo = manifest.uploaded
-            .filter { !isTerminal(brainState[$0.key]) }
-            .sorted { $0.key > $1.key }
-            .prefix(limit)
+        var manifest = manifest
+        let todo = SyncPlanner.pollTargets(
+            uploaded: manifest.uploaded,
+            terminal: Set(manifest.uploaded.keys.filter { isTerminal(brainState[$0]) }),
+            missingOnServer: Set(manifest.missingOnServer.keys),
+            pollFailures: manifest.pollFailures,
+            limit: limit)
         guard !todo.isEmpty else { return }
+        var ledgerChanged = false
         for (base, sid) in todo {
             let st: DeepBrain.SessionState
             do {
                 st = try await brain.sessionState(sid)
+            } catch DeepBrainError.notFound {
+                // **深脑说这条不存在，就此打住，并且写进账本。**
+                //
+                // 2026-09-18：8 条 8 月 28 日在服务端被删掉的录音，本地账本里还记着
+                // 会话 id，轮询每 48 秒把它们捞出来问一遍，问到 404 之后
+                // `catch { continue }` 吞掉——状态永远到不了终态，于是永远重问。
+                // 7 天 88,923 次 404，占深脑全站请求的 24.6%。
+                // 只记在内存里不够：重启之后账本还在，又会从头刷起。
+                manifest.missingOnServer[base] = Self.stamp(Date())
+                manifest.pollFailures[base] = nil
+                ledgerChanged = true
+                brainState[base] = ("deleted", nil, nil)
+                log.write("\(base) 在深脑里已不存在（服务端回 404），不再查它；本地留档不动")
+                continue
             } catch DeepBrainError.sessionRevoked {
                 // 这条轮询也会撞上失效的登录（它查的是还没处理完的会话）。
                 // 以前这里是 try?，失效被当成「查不到」吞掉，界面停在「处理中」。
@@ -1655,10 +1714,21 @@ public final class SyncEngine: ObservableObject {
                 markSessionRevoked()
                 return
             } catch {
+                // 网络抖动 / 5xx：记一次，攒够 pollGiveUpAfter 就不再查这一条。
+                // 没有这道总闸的话，任何一种「服务端答不上来」都会变成永久轮询——
+                // 404 那条路只是它第一次露面的形态。
+                let n = (manifest.pollFailures[base] ?? 0) + 1
+                manifest.pollFailures[base] = n
+                ledgerChanged = true
+                if n == SyncPlanner.pollGiveUpAfter {
+                    log.write("\(base) 连续 \(n) 次查不到状态，先不查了；下次它有新动静（重推/重新登录）会重来")
+                }
                 continue
             }
+            if manifest.pollFailures[base] != nil { manifest.pollFailures[base] = nil; ledgerChanged = true }
             brainState[base] = (st.status, st.transcriptId, st.errorCode)
         }
+        if ledgerChanged { persist(manifest) }
         // 顺带批量拉一次「还没指认的说话人」——待办区靠它判断要不要认人。
         // 放在这里而不是单独一轮：本来就已经连着深脑了，省一次往返。
         let tids = brainState.values.compactMap { $0.transcript }
@@ -1732,7 +1802,8 @@ public final class SyncEngine: ObservableObject {
                                        plans: manifest.plan,
                                        skippedShort: skippedShort, pendingDelete: pendingDeviceDelete,
                                        starred: Set(manifest.starred),
-                                       dismissed: Set(manifest.dismissed))
+                                       dismissed: Set(manifest.dismissed),
+                                       missingOnServer: Set(manifest.missingOnServer.keys))
     }
 
     /// 目录下某扩展名的文件：base → 字节数。
@@ -1846,6 +1917,15 @@ public final class SyncEngine: ObservableObject {
     }
 
     /// 界面调用：刚刚重新登录成功。立刻把积压的推上去，不等下一轮定时器。
+    /// 人手重推一条时，把它从「不再查」里放出来——用户的动作是新信息。
+    private func clearPollGiveUp(_ base: String) {
+        var m = SyncManifest.load(from: paths.manifest)
+        guard m.pollFailures[base] != nil || m.missingOnServer[base] != nil else { return }
+        m.pollFailures[base] = nil
+        m.missingOnServer[base] = nil
+        persist(m)
+    }
+
     public func signedInAgain() {
         needsSignIn = false
         brain = nil
@@ -2365,6 +2445,7 @@ public extension SyncEngine {
     /// （`DeepBrain.upload` 的 alreadyDone 分支），等于什么都没做。所以换一个带轮次后缀的键，
     /// 在深脑那边建一个全新的会话。
     func repushFailed(_ base: String) {
+        clearPollGiveUp(base)
         Task { @MainActor in
             guard let brain = await ensureBrain() else {
                 log.write("重推 \(base) 失败：没接通深脑")
@@ -2543,6 +2624,7 @@ public extension SyncEngine {
     /// 手动推一条（无视时长门槛）。
     /// 门槛是省钱用的默认规则，不是禁令——你说要推就是要推。
     func pushNow(_ base: String) {
+        clearPollGiveUp(base)
         Task { @MainActor in
             guard let brain = await ensureBrain() else {
                 log.write("手动推送 \(base) 失败：没接通深脑"); return

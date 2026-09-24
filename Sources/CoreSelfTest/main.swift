@@ -191,6 +191,59 @@ do {
         check("46 秒没广播也没连着 → 不在旁边", d.isNearby(now: t0.addingTimeInterval(46)), false)
     }
 
+    // ── 状态轮询：404 之后不许再问 ─────────────────────────────────
+    // 2026-09-18 实测：8 条 8 月 28 日在服务端被删掉的录音，本地账本还记着会话 id，
+    // 轮询每 48 秒把它们捞出来问一遍，404 被 catch{continue} 吞掉、状态永远到不了终态，
+    // 于是永远重问。7 天 88,923 次 404，占深脑全站 HTTP 请求的 24.6%，跨 10 个客户端版本。
+    do {
+        let up = ["a": "sid-a", "b": "sid-b", "c": "sid-c"]
+
+        check("没有任何标记时三条都要查",
+              SyncPlanner.pollTargets(uploaded: up, terminal: [], missingOnServer: [],
+                                      pollFailures: [:]).count, 3)
+
+        // 核心：被判定「服务端已不存在」之后，这一条不能再出现在待查名单里。
+        let after404 = SyncPlanner.pollTargets(uploaded: up, terminal: [],
+                                               missingOnServer: ["b"], pollFailures: [:])
+        check("404 之后不再查它", after404.contains { $0.base == "b" }, false)
+        check("404 只停这一条，别的照查", after404.count, 2)
+
+        check("到了终态也不再查",
+              SyncPlanner.pollTargets(uploaded: up, terminal: ["a"], missingOnServer: [],
+                                      pollFailures: [:]).contains { $0.base == "a" }, false)
+
+        // 总闸：非 404 的失败（网络抖动、5xx）也必须有个头。
+        check("差一次到总闸，仍然查",
+              SyncPlanner.pollTargets(uploaded: up, terminal: [], missingOnServer: [],
+                                      pollFailures: ["c": SyncPlanner.pollGiveUpAfter - 1])
+                .contains { $0.base == "c" }, true)
+        check("到总闸就不查了",
+              SyncPlanner.pollTargets(uploaded: up, terminal: [], missingOnServer: [],
+                                      pollFailures: ["c": SyncPlanner.pollGiveUpAfter])
+                .contains { $0.base == "c" }, false)
+
+        // 三个理由同时成立时，名单为空——不会因为漏判某一个又把请求放出去。
+        check("三条各占一个理由 → 一条都不查",
+              SyncPlanner.pollTargets(uploaded: up, terminal: ["a"], missingOnServer: ["b"],
+                                      pollFailures: ["c": SyncPlanner.pollGiveUpAfter]).count, 0)
+
+        // 证明拦住它的确实是这个标记：把标记拿掉（即修复前的状态），它立刻又进名单。
+        // 这就是 09-18 那 88,923 次 404 的机制——每一轮都把它重新捞出来问一遍。
+        check("没有这个标记时它会被重新捞出来（修复前的行为）",
+              SyncPlanner.pollTargets(uploaded: up, terminal: [], missingOnServer: [],
+                                      pollFailures: [:]).contains { $0.base == "b" }, true)
+
+        // 账本要能跨重启：只记在内存里的话，重启后又会从头刷。
+        var m = SyncManifest()
+        m.missingOnServer["b"] = "2026-09-18 10:00:00"
+        m.pollFailures["c"] = 3
+        let back = try! JSONDecoder().decode(SyncManifest.self, from: JSONEncoder().encode(m))
+        check("「服务端已不存在」跨读写还在", back.missingOnServer["b"] ?? "", "2026-09-18 10:00:00")
+        check("轮询失败计数跨读写还在", back.pollFailures["c"] ?? 0, 3)
+        let old = try! JSONDecoder().decode(SyncManifest.self, from: Data(#"{"imported":{}}"#.utf8))
+        check("老清单没有这两个键也不报错", old.missingOnServer.count + old.pollFailures.count, 0)
+    }
+
     // ── 短录音门槛：批量推送没有例外 ───────────────────────────────
     // 2026-09-14 重新登录那一下，1/7/12 秒三条录音被一起推进深脑——
     // 批量队列的 force 本意只是「别等重试间隔」，却顺手绕过了时长门槛。

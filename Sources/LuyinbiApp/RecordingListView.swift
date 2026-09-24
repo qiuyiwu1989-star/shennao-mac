@@ -190,6 +190,7 @@ struct RecordingListView: View {
         case .skipped:      return "太短未推"
         case .noSpeech:     return "没有人声"
         case .dismissed:    return "已忽略"
+        case .serverGone:   return "深脑里已删除"
         case .pendingDel:   return "等着删除"
         case .liveOnDevice: return "正在录"
         case .onDeviceOnly: return "在录音笔上"

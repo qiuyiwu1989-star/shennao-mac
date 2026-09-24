@@ -32,6 +32,8 @@ public struct RecordingItem: Identifiable, Sendable {
     public var starred = false
     /// 人手标了「忽略」。只影响计数和配色，不动录音本身。
     public var dismissed = false
+    /// 深脑里已经没有这条了（服务端回 404）。本地留档不受影响。
+    public var serverGone = false
     /// 还没指认的说话人个数。>0 就该进「需要你处理」——
     /// 不指认的话，后面所有洞察里都是「说话人1」。
     public var unconfirmedSpeakers: Int = 0

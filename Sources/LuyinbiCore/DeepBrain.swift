@@ -24,6 +24,9 @@ public enum DeepBrainError: Error, CustomStringConvertible {
     /// 只有重新登录能解。必须跟 `.http` 分开——混在一起，它就会被当成一次偶发失败，
     /// 按指数退避无限重试下去。
     case sessionRevoked
+    /// 服务端明确说这个东西不存在（404）。**不是网络问题，也不会自己好**——
+    /// 重试多少次都一样，调用方应当就此把它记成终态，而不是继续问。
+    case notFound(String)
     case http(String, Int, String)
     case badResponse(String)
     /// 录音链路来的转写是「权威数据」，深脑只允许服务端改。
@@ -34,6 +37,7 @@ public enum DeepBrainError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .notLoggedIn: return "尚未登录深脑"
+        case .notFound(let what): return "\(what)：深脑里已经没有这条记录了"
         case .sessionRevoked:
             return "登录已失效——在网页或别的设备上点「退出登录」会连带让这里失效，重新登录一次即可"
         case .http(let what, let code, let body): return "\(what) 失败 HTTP \(code)：\(body.prefix(200))"
@@ -401,6 +405,9 @@ public final class DeepBrain {
         // upload() 那批调用今天早些时候已经改成 authed()，这条路径漏改了。
         let (st, d) = try await authed("GET", "\(config.apiBase)/api/recordings/\(id)",
                                         headers: { try self.authHeaders })
+        // 404 = 这条录音在深脑那边已经被删了。以前它掉进调用方的 `catch { continue }`，
+        // 于是这条会话永远到不了终态、永远被下一轮轮询捞出来重问。
+        if st == 404 { throw DeepBrainError.notFound("查会话 \(id)") }
         guard let o = try json(st, d, "查会话") as? [String: Any],
               let s = o["session"] as? [String: Any] else { throw DeepBrainError.badResponse("没有 session") }
         return SessionState(status: s["status"] as? String ?? "未知",

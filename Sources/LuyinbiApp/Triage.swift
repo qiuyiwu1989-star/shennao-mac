@@ -26,6 +26,8 @@ enum Triage {
         case noSpeech
         /// 真失败、但人手标了「忽略」。不再计入待办，录音和深脑记录都不动。
         case dismissed
+        /// 深脑里已经被删了。本地留档还在，不用管，也没什么可修的。
+        case serverGone
         case pendingDel    // 排队等着从设备删
         case done          // 一切正常
 
@@ -39,6 +41,7 @@ enum Triage {
             case .skipped:      return "太短未推送"
             case .noSpeech:     return "没有人声"
             case .dismissed:    return "已忽略"
+            case .serverGone:   return "深脑里已删除"
             case .liveOnDevice: return "录音笔正在录"
             case .onDeviceOnly: return "还在录音笔上"
             case .pendingDel:   return "等着从设备删"
@@ -55,6 +58,7 @@ enum Triage {
             case .skipped:      return "clock.badge.questionmark"
             case .noSpeech:     return "waveform.slash"
             case .dismissed:    return "eye.slash"
+            case .serverGone:   return "cloud.slash"
             case .liveOnDevice: return "record.circle"
             case .onDeviceOnly: return "externaldrive"
             case .pendingDel:   return "trash"
@@ -73,6 +77,7 @@ enum Triage {
             // 这两个都是「不用你管」，跟「太短未推送」同一个中性色，别喊。
             case .noSpeech:     return DS.ink300
             case .dismissed:    return DS.ink300
+            case .serverGone:   return DS.ink300
             // 这两个都不是「进行中」，不能用那个蓝——用中性色，别喊。
             case .liveOnDevice: return DS.ink300
             case .onDeviceOnly: return DS.ink300
@@ -91,6 +96,7 @@ enum Triage {
             case .skipped:      return "本地留着了，需要的话可以手动推给深脑"
             case .noSpeech:     return "录音里没检测到人声，多半是误按了录音键，不用管"
             case .dismissed:    return "你标了忽略，不再计入待办；想恢复可以取消忽略"
+            case .serverGone:   return "这条在深脑里已被删除，本地留档还在；想重新入库点「重新推送」"
             case .liveOnDevice: return "录完自己就会同步，不用管"
             case .onDeviceOnly: return "等录音笔连上就会自动导入"
             case .pendingDel:   return "设备下次连上就删"
@@ -110,6 +116,9 @@ enum Triage {
         if item.lastError?.contains("录音中") == true { return .liveOnDevice }
         // 太短是「按你定的规则跳过」，不是故障——不能混进待办里让人以为出了问题
         if item.skippedShortSeconds != nil && !item.inBrain { return .skipped }
+        // 深脑里已经没有这条了。排在失败之前：它不是故障，也不该进待办，
+        // 更不该让客户端继续去问（2026-09-18 那 88,923 次 404 就是这么来的）。
+        if item.serverGone { return .serverGone }
         if item.brainStatus == "failed" {
             // 顺序有讲究：「没有人声」先判——它根本不该算失败，
             // 也就谈不上要不要人手去忽略它。
